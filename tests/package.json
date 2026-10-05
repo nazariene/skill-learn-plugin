@@ -1,0 +1,11 @@
+{
+  "name": "skill-learn-tests",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@opencode/ai": "2.0.21",
+    "@opencode/client": "2.0.21",
+    "effect": "4.0.0-rc.112",
+    "opencode-ai-v2-0-6": "npm:@opencode/ai@2.0.6"
+  }
+}

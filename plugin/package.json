@@ -1,0 +1,9 @@
+{
+  "name": "skill-learn-opencode-v2-runtime",
+  "private": true,
+  "type": "module",
+  "exports": "./index.js",
+  "dependencies": {
+    "@opencode/client": "2.0.21"
+  }
+}

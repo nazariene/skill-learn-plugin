@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skill-learn-plugin"
+version = "0.1.0"
+description = "Harness-native skill learning with a Python core and offline reports"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0,<7"]
+
+[project.scripts]
+skill-learn = "skill_learn.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["skill_learn*"]
+
+[tool.setuptools.package-data]
+skill_learn = ["HERMES_LICENSE.txt", "sounds/*.wav", "sounds/README.md"]

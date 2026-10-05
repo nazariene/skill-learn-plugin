@@ -1,0 +1,13 @@
+# Local review state and installed packages. The example settings file is the template.
+__pycache__/
+*.swp
+*.py[cod]
+.venv/
+state.sqlite
+state.sqlite-shm
+state.sqlite-wal
+skills/
+auth.json
+settings.yaml
+# npm dependencies at any depth; commit manifests and lockfiles only.
+node_modules/

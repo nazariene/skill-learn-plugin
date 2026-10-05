@@ -1,0 +1,38 @@
+runtime:
+  python: python3
+  leaseSeconds: 60
+triggers:
+  idle:
+    enabled: true
+    seconds: 15
+  turns:
+    enabled: true
+    count: 25
+llm:
+  selection: follow
+  model: openai/gpt-5.5
+  variant: medium
+  steps: 16
+  contextWindow: null
+review:
+  contextMode: auto
+  maxForkInputTokens: 120000
+  maxInputTokens: null
+library:
+  root: null # Optional; defaults to OpenCode's global skills folder.
+approval:
+  user: manual
+  generated: auto
+notifications:
+  enabled: true
+  volume: 1
+  types:
+    initiated: true
+    started: true
+    finished: true
+    unchanged: true
+    failed: true
+    cancelled: true
+reports:
+  enabled: true
+  root: reports
