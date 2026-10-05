@@ -18,7 +18,7 @@ GROUPS = {
     "llm": {"selection", "model", "variant", "steps", "contextWindow"},
     "review": {"contextMode", "maxInputTokens", "maxForkInputTokens"},
     "library": {"root"}, "approval": {"user", "generated"},
-    "notifications": {"enabled", "volume", "types"}, "reports": {"enabled", "root"},
+    "notifications": {"enabled", "volume", "types"}, "reports": {"root"},
 }
 
 
@@ -96,7 +96,6 @@ class Settings:
     notifications_enabled: bool
     notification_volume: float
     notification_types: dict
-    reports_enabled: bool
     reports_root: Path
 
     def input_budget(self, window=None):
@@ -160,6 +159,6 @@ def load_settings(home=DEFAULT_HOME):
         integer(review.get("maxInputTokens"), "review.maxInputTokens", nullable=True),
         integer(review.get("maxForkInputTokens", 120000), "review.maxForkInputTokens", 1, True),
         library_root, user, generated,
-        enabled, float(volume), types, boolean(reports.get("enabled", True), "reports.enabled"),
+        enabled, float(volume), types,
         path_from(home, reports.get("root", "reports"), "reports.root"),
     )

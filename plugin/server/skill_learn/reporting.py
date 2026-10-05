@@ -64,8 +64,6 @@ class ReportSnapshot:
 
 
 def generate(store, settings):
-    if not settings.reports_enabled:
-        return None
     root = settings.reports_root
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".skill-learn-report.lock").open("a") as lock:

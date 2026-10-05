@@ -76,7 +76,7 @@ Edit `<home>/settings.yaml` using the [template](docs/settings.example.yaml), th
 | `approval.user` | `manual` | Accepts `manual`/`auto`; neither overrides user-owned skill protection |
 | `notifications.enabled` / `notifications.volume` | `true` / `1` | Lifecycle sounds; volume 0–1, with 0 muting playback |
 | `notifications.types` | All `true` | Individual switches for `initiated`, `started`, `finished`, `unchanged`, `failed` and `cancelled` |
-| `reports.enabled` / `reports.root` | `true` / `reports` | Enable reports and select their directory |
+| `reports.root` | `reports` | Output directory for the explicit `report` command |
 
 **Paths:** OpenCode config resolves from `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then `~/.config/opencode`. Missing/null `library.root` uses its global `skills/` folder. Explicit library/report paths resolve from the plugin home unless absolute; `~` and symlinks work. `library.root: skills` selects `<home>/skills/` and is preserved on reinstall.
 
@@ -93,7 +93,7 @@ Edit `<home>/settings.yaml` using the [template](docs/settings.example.yaml), th
 5. **Protect skills.** New skills carry `metadata.origin: generated`. Reviews refuse edits to user-owned, pinned or protected skills and refuse whole-skill deletion. `adopt` explicitly transfers a skill to agent management. Support files stay under `references/`, `templates/` or `scripts/`; patches must match uniquely. Approval checks current file hashes before staged publication.
 6. **Recover without replay.** New submissions supersede older work for the same parent, cancelling only its reviewer. Recovery reconnects to retained sessions and collects completed results once. Missing/ambiguous execution or interrupted publication is reconciled, not automatically replayed. Reviewer retries and auxiliary model calls are blocked.
 
-Reports refresh after terminal reviews and management changes. Lifecycle sounds use bundled JennyNeural recordings, played locally without overlap or runtime TTS. A WAV player such as `paplay`, `pw-play` or `ffplay` is required. Sound/report failures do not change review outcomes.
+Reports are generated only by the `report` command; reviews and management changes do not create or refresh them. Lifecycle sounds use bundled JennyNeural recordings, played locally without overlap or runtime TTS. A WAV player such as `paplay`, `pw-play` or `ffplay` is required. Sound failures do not change review outcomes.
 
 The skill catalogue and loaded bodies remain a snapshot until restart; Python validates writes against current files. Missing runtime dependencies disable learning without stopping ordinary chat.
 
@@ -124,7 +124,7 @@ Adjust the path for custom installations. Put `--home PATH` before the command t
 
 Stop/reconcile active reviews before deleting their history. Other recovery states: `reconcile --help`; `--state finished` requires a `--result` file with the final review text.
 
-Open the reported `index.html` for **Summary**, **Review sessions** and **Skills & proposals**, with filters and expandable evidence. Reports work offline after OpenCode exits and have no editing controls. Failed generation preserves the previous complete report.
+Open the reported `index.html` for **Summary**, **Review sessions** and **Skills & proposals**, with filters and expandable evidence. Reports work offline after OpenCode exits and have no editing controls. Run `report` again for an updated snapshot. Failed generation reports an error and preserves the previous complete report.
 
 ### Background-session metadata
 

@@ -50,18 +50,6 @@ class Core:
             self.operation_identity = None
             return envelope
 
-    def refresh(self):
-        if not self.settings.reports_enabled:
-            return None
-        try:
-            from .reporting import generate
-            return str(generate(self.store, self.settings))
-        except Exception as error:
-            # Output failure must never rewrite a learning outcome.
-            import sys
-            print(f"skill-learn report: {error}", file=sys.stderr)
-            return None
-
     def dispatch(self, operation, payload):
         if operation == "hello":
             return {"ok": True, "result": {"version": 1, "python": self.settings.python, "triggers": self.settings.triggers,
@@ -154,7 +142,6 @@ class Core:
                 self.notifier.play("initiated", answer["reviewId"])
             for review_id in answer.get("cancelled", []):
                 self.notifier.play("cancelled", review_id)
-            self.refresh()
             return answer
         if operation == "claim":
             answer = self.store.claim(payload["owner"], payload["hostID"], self.settings.lease_seconds, payload.get("hostScope"), payload.get("hostPID"))
@@ -241,7 +228,6 @@ class Core:
                 if plan.get("probeID"):
                     self.store.update_probe(plan["probeID"], "cancelled", row["id"])
                 self.notifier.play("cancelled", row["id"])
-                self.refresh()
             return {"cancelled": True}
         if operation == "reconcile":
             row = self.store.review_row(payload["reviewID"])
@@ -268,18 +254,16 @@ class Core:
             if plan.get("probeID"):
                 self.store.update_probe(plan["probeID"], "cancelled" if row["cancel_requested"] else "failed", row["id"], "Native session interrupted")
             self.notifier.play("cancelled" if row["cancel_requested"] else "failed", row["id"])
-            self.refresh()
             return {"settled": True, "replayed": False}
         if operation == "report":
-            return {"index": self.refresh()}
+            from .reporting import generate
+            return {"index": str(generate(self.store, self.settings))}
         if operation == "delete-session":
             rows = self.store.reviews_for_session(payload["harness"], payload["sessionID"])
             if any(row["status"] == "running" for row in rows):
                 self.store.cancel_open(payload["harness"], payload["sessionID"])
-                self.refresh()
                 raise SkillServiceError("Active native reviewer must be aborted/reconciled before deletion")
             count = self.store.delete_session(payload["harness"], payload["sessionID"])
-            self.refresh()
             return {"deletedReviews": count}
         if operation == "pending":
             return {"ok": True, "result": self.store.pending_proposals()}
@@ -291,9 +275,7 @@ class Core:
                 answer = {**answer, "evidence": self.store.evidence(payload["id"]), "calls": self.store.model_calls_for_review(payload["id"]), "context": self.store.review_context(payload["id"])}
             return {"ok": True, "result": answer}
         if operation in {"approve", "reject", "adopt", "pin", "unpin"}:
-            answer = self.library.pin(payload["id"], operation == "pin") if operation in {"pin", "unpin"} else getattr(self.library, operation)(payload["id"])
-            self.refresh()
-            return answer
+            return self.library.pin(payload["id"], operation == "pin") if operation in {"pin", "unpin"} else getattr(self.library, operation)(payload["id"])
         raise SkillServiceError(f"Unknown operation {operation}")
 
     def finish(self, payload):
@@ -312,7 +294,6 @@ class Core:
             if plan.get("probeID"):
                 self.store.update_probe(plan["probeID"], "cancelled", row["id"])
             self.notifier.play("cancelled", row["id"])
-            self.refresh()
             return {"outcome": "cancelled"}
         text = payload.get("text", "").strip()
         plan = json.loads(row["plan_json"] or "{}")
@@ -348,7 +329,6 @@ class Core:
         if plan.get("probeID"):
             self.store.update_probe(plan["probeID"], "failed" if outcome == "failed" else "finished", row["id"], error)
         self.notifier.play("unchanged" if outcome == "unchanged" else "finished" if outcome in {"applied", "staged"} else "failed", row["id"])
-        self.refresh()
         return {"outcome": outcome, "error": error}
 
     def validate_feedback(self, changes):

@@ -326,7 +326,7 @@ test("turn trigger waits for settlement and repeated user delivery does not coun
 
 test("child transports large stdin, isolates errors and terminates on disposal or failure", async t => {
   const home = mkdtempSync("/tmp/opencode/skill-child-")
-  writeFileSync(resolve(home, "settings.yaml"), "library:\n  root: skills\nnotifications:\n  enabled: false\nreports:\n  enabled: false\n")
+  writeFileSync(resolve(home, "settings.yaml"), "library:\n  root: skills\nnotifications:\n  enabled: false\n")
   const core = new ChildCore({ home })
   t.after(async () => { await core.dispose(); rmSync(home, { recursive: true, force: true }) })
   const evidence = "large stdin evidence".repeat(100000)
@@ -433,7 +433,7 @@ test("a live unbound claim is retained, ambiguous recovery is surfaced, missing 
 
 test("child crash aborts only internal execution and ordinary parent hooks remain usable", async t => {
   const home = mkdtempSync("/tmp/opencode/skill-crash-")
-  writeFileSync(resolve(home, "settings.yaml"), "library:\n  root: skills\nreports:\n  enabled: false\nnotifications:\n  enabled: false\ntriggers:\n  idle:\n    seconds: 0\n")
+  writeFileSync(resolve(home, "settings.yaml"), "library:\n  root: skills\nnotifications:\n  enabled: false\ntriggers:\n  idle:\n    seconds: 0\n")
   const host = fakeHost(), timers = timerQueue(), diagnostics = []
   let core
   const hooks = await createPlugin({ directory: home, client: host.client }, { home }, { ...timers, hostVersion,
@@ -455,7 +455,7 @@ test("isolated copy install bundles runtime and preserves settings and unrelated
   t.after(() => rmSync(directory, { recursive: true, force: true }))
   const destination = resolve(directory, "plugins"), home = resolve(directory, "home")
   mkdirSync(destination); mkdirSync(home)
-  const settings = "library:\n  root: skills\nreports:\n  enabled: false\nnotifications:\n  enabled: false\n"
+  const settings = "library:\n  root: skills\nnotifications:\n  enabled: false\n"
   writeFileSync(resolve(home, "settings.yaml"), settings)
   writeFileSync(resolve(destination, "unrelated.js"), "export default () => ({})")
   const installer = resolve(import.meta.dirname, "../install.sh")
@@ -489,7 +489,7 @@ test("Bash replacement keeps settings and databases while removing other old fil
   symlinkSync(resolve(harness, "plugins"), destination)
   const plugin = resolve(harness, "plugins/skill-learn")
   mkdirSync(plugin)
-  const settings = "library:\n  root: skills\nnotifications:\n  enabled: false\nreports:\n  enabled: true\n"
+  const settings = "library:\n  root: skills\nnotifications:\n  enabled: false\nreports:\n  root: reports\n"
   writeFileSync(resolve(plugin, "settings.yaml"), settings)
   mkdirSync(resolve(plugin, "reports")); mkdirSync(resolve(plugin, "skills/kept"), { recursive: true })
   writeFileSync(resolve(plugin, "reports/operator-note.txt"), "Obsolete report notes")

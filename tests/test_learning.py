@@ -28,7 +28,7 @@ class LearningTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.home = Path(self.temporary.name)
-        (self.home / "settings.yaml").write_text("library:\n  root: skills\nreports:\n  enabled: false\nnotifications:\n  enabled: false\n")
+        (self.home / "settings.yaml").write_text("library:\n  root: skills\nnotifications:\n  enabled: false\n")
         self.core = Core(self.home)
         self.addCleanup(self.temporary.cleanup)
         self.addCleanup(self.core.close)
@@ -235,7 +235,7 @@ class LearningTests(unittest.TestCase):
     def test_notifications_are_off_path_distinct_muted_and_fail_isolated(self):
         calls = []
         settings_path = self.home / "settings.yaml"
-        settings_path.write_text("reports:\n  enabled: false\nnotifications:\n  enabled: true\n")
+        settings_path.write_text("notifications:\n  enabled: true\n")
         with patch.dict(os.environ, {"SKILL_LEARNING_NOTIFICATIONS": "1"}):
             notifier = Notifier(load_settings(self.home), self.core.store, lambda cue, phrase, volume: calls.append((cue, phrase)))
         for cue in ("initiated", "started", "finished", "unchanged", "failed", "cancelled"):

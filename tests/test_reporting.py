@@ -57,6 +57,7 @@ class ReportingTests(unittest.TestCase):
         first = self.review(name=hostile, result="Nothing to save.")
         second = self.review(watermark="two", name=hostile, result='{"changes":[{"name":"ordering","action":"create","content":"Use for ordering work."}]}')
         self.request("enqueue", harness="opencode", hostID="host", sessionID="delegate", sessionName="Delegate", watermark="d", messages=[], delegateDepth=1)
+        self.cli("report")
         directory = self.generation()
         index = (self.core.settings.reports_root / "index.html").read_text()
         self.assertIn('data-section="summary"', index)
@@ -146,6 +147,7 @@ class ReportingTests(unittest.TestCase):
 
     def test_failed_generation_retains_all_previous_pages_and_foreign_files(self):
         review = self.review()
+        self.cli("report")
         root, old = self.core.settings.reports_root, self.generation()
         index = (root / "index.html").read_bytes()
         detail = (old / f"review-{review}.html").read_bytes()
@@ -169,9 +171,17 @@ class ReportingTests(unittest.TestCase):
         with patch("skill_learn.reporting.os.replace", fail_entrypoint), self.assertRaises(OSError):
             generate(self.core.store, self.core.settings)
         self.assertEqual((root / "index.html").read_bytes(), before_swap)
+        (root / ".skill-learn-report.json").write_text(json.dumps({"format": "another-publisher"}))
+        self.assertIn("another publisher", self.cli("report", ok=False))
+        self.assertEqual((root / "index.html").read_bytes(), before_swap)
+        self.assertEqual(self.core.store.review_row(review)["outcome"], "unchanged")
 
-    def test_management_rename_deletion_and_active_reconciliation_without_host(self):
+    def test_reports_are_explicit_snapshots_across_management_and_recovery(self):
         review = self.review(result='{"changes":[{"name":"ordering","action":"create","content":"Use for ordering work."}]}')
+        root = self.core.settings.reports_root
+        self.assertFalse(root.exists())
+        index = Path(self.cli("report")["index"])
+        snapshot = index.read_bytes()
         proposal = self.cli("pending")[0]["id"]
         self.assertEqual(self.cli("show", proposal)["status"], "pending")
         self.assertTrue(self.cli("approve", proposal)["ok"])
@@ -180,7 +190,10 @@ class ReportingTests(unittest.TestCase):
         self.assertTrue(self.cli("adopt", "ordering")["ok"])
         self.assertEqual(self.cli("show", review)["outcome"], "staged")
         self.request("enqueue", harness="opencode", hostID="host", sessionID="session", watermark="one", sessionName="Renamed session", messages=[])
-        self.assertIn("Renamed session", (self.core.settings.reports_root / "index.html").read_text())
+        self.assertEqual(index.read_bytes(), snapshot)
+        self.cli("report")
+        self.assertIn("Renamed session", index.read_text())
+        snapshot = index.read_bytes()
         second = self.review(session="another", result='{"changes":[{"name":"rejected","action":"create","content":"Use for different work."}]}')
         pending = self.cli("pending")[0]["id"]
         self.cli("reject", pending)
@@ -190,20 +203,30 @@ class ReportingTests(unittest.TestCase):
         self.assertTrue((self.home / "skills/ordering/SKILL.md").is_file())
         self.assertIsNotNone(self.core.store.review_row(second))
         self.assertIsNone(self.core.store.review_row(review))
+        self.assertEqual(index.read_bytes(), snapshot)
+        self.assertTrue((old / f"review-{review}.html").exists())
+        self.cli("report")
         self.assertFalse((old / f"review-{review}.html").exists())
+        snapshot = index.read_bytes()
         active = self.request("enqueue", harness="opencode", hostID="host", sessionID="active", watermark="a", messages=[])["reviewId"]
         self.request("claim", hostID="host", owner="owner")
         self.assertIn("reconciled", self.cli("delete-session", "opencode", "active", ok=False))
         self.assertTrue(self.core.store.cancel_requested(active))
         self.cli("reconcile", active, "--state", "abandoned")
         self.cli("delete-session", "opencode", "active")
+        cancelled = self.request("enqueue", harness="opencode", hostID="host", sessionID="cancelled", watermark="c", messages=[])["reviewId"]
+        self.request("claim", hostID="host", owner="owner")
+        self.request("cancel", reviewID=cancelled, hostSettled=True)
+        self.assertEqual(index.read_bytes(), snapshot)
         self.assertTrue(Path(self.cli("report")["index"]).is_file())
+        self.assertNotEqual(index.read_bytes(), snapshot)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for file-URL acceptance")
     def test_file_url_browser_filters_links_themes_and_narrow_layout(self):
         first = self.review()
         failed = self.review(watermark="two", result="invalid result")
         other = self.review(session="dns", name="DNS investigation", result='{"changes":[{"name":"dns-checks","action":"create","content":"Use for DNS checks."}]}')
+        self.cli("report")
         root, directory = self.core.settings.reports_root, self.generation()
         assertions = r"""
         <script>

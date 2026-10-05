@@ -123,7 +123,7 @@ function hostFixture(directory, version) {
 
 async function fixture(t, version = "2.0.21", settings = "") {
   const home = mkdtempSync("/tmp/opencode/skill-v2-")
-  writeFileSync(resolve(home, "settings.yaml"), "library:\n  root: skills\nnotifications:\n  enabled: false\nreports:\n  enabled: false\ntriggers:\n  idle:\n    seconds: 0\n" + settings)
+  writeFileSync(resolve(home, "settings.yaml"), "library:\n  root: skills\nnotifications:\n  enabled: false\ntriggers:\n  idle:\n    seconds: 0\n" + settings)
   const host = hostFixture(home, version), core = new ChildCore({ home }), operations = [], timers = new Set(), diagnostics = []
   const wrapped = { get closed() { return core.closed }, dispose: () => core.dispose(), request: async (...args) => {
     const answer = await core.request(...args); operations.push({ op: args[0], payload: args[1], answer }); return answer

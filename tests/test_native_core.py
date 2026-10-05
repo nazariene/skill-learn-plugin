@@ -27,7 +27,7 @@ class NativeCoreTests(unittest.TestCase):
         config = patch.dict(os.environ, {"OPENCODE_CONFIG_DIR": str(self.home / "opencode")})
         config.start()
         self.addCleanup(config.stop)
-        (self.home / "settings.yaml").write_text("library:\n  root: skills\nnotifications:\n  enabled: false\nreports:\n  enabled: false\n")
+        (self.home / "settings.yaml").write_text("library:\n  root: skills\nnotifications:\n  enabled: false\n")
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -54,7 +54,7 @@ class NativeCoreTests(unittest.TestCase):
             self.assertFalse(load_settings(self.home).notifications_enabled)
 
     def test_invalid_removed_and_duplicate_settings(self):
-        for text in ("server: {}", "llm:\n  apiKey: secret", "llm:\n  authFile: auth.json", "llm:\n  selection: service", "llm:\n  selection: []", "approval:\n  generated: []", "reports:\n  enabled: 'false'", "review:\n  maxForkInputTokens: 0", "runtime:\n  leaseSeconds: true", "notifications:\n  volume: .nan", "reports:\n  enabled: true\n  enabled: false", "triggers:\n  idle:\n    seconds: -1", "library:\n  root: 12", "library:\n  root: ''", "library:\n  root: false", "library:\n  root: []"):
+        for text in ("server: {}", "llm:\n  apiKey: secret", "llm:\n  authFile: auth.json", "llm:\n  selection: service", "llm:\n  selection: []", "approval:\n  generated: []", "reports:\n  enabled: true", "reports:\n  enabled: false", "review:\n  maxForkInputTokens: 0", "runtime:\n  leaseSeconds: true", "notifications:\n  volume: .nan", "reports:\n  root: reports\n  root: other-reports", "triggers:\n  idle:\n    seconds: -1", "library:\n  root: 12", "library:\n  root: ''", "library:\n  root: false", "library:\n  root: []"):
             with self.subTest(text=text), self.assertRaises(SkillServiceError):
                 self.settings(text)
 
@@ -78,7 +78,7 @@ class NativeCoreTests(unittest.TestCase):
         self.assertEqual(self.settings("library:\n  root: null").library_root, library)
 
     def test_default_library_reads_global_skills_and_publishes_only_generated_changes(self):
-        self.settings("notifications:\n  enabled: false\nreports:\n  enabled: false\n")
+        self.settings("notifications:\n  enabled: false\n")
         root = self.home / "opencode/skills"
         user_skill = root / "user-procedure/SKILL.md"
         user_skill.parent.mkdir(parents=True)
@@ -97,15 +97,14 @@ class NativeCoreTests(unittest.TestCase):
         self.assertEqual(user_skill.read_text(), original)
         self.assertFalse((self.home / "skills").exists())
 
-    def test_absolute_expanded_paths_and_disabled_outputs(self):
-        settings = self.settings("library:\n  root: ~/skills\nreports:\n  root: /absolute/reports\n  enabled: false\nnotifications:\n  enabled: false\nreview:\n  maxInputTokens: -1\n")
+    def test_absolute_expanded_paths_and_muted_notifications(self):
+        settings = self.settings("library:\n  root: ~/skills\nreports:\n  root: /absolute/reports\nnotifications:\n  enabled: false\nreview:\n  maxInputTokens: -1\n")
         self.assertEqual(settings.library_root, Path.home() / "skills")
         self.assertEqual(settings.reports_root, Path("/absolute/reports"))
         self.assertIsNone(settings.input_budget())
-        self.settings("reports:\n  enabled: false\nnotifications:\n  enabled: false\n")
+        self.settings("notifications:\n  enabled: false\n")
         core = Core(self.home)
         self.addCleanup(core.close)
-        self.assertIsNone(core.refresh())
         self.assertFalse((self.home / "reports").exists())
         self.assertFalse(core.settings.notifications_enabled)
 
@@ -179,7 +178,6 @@ class NativeCoreTests(unittest.TestCase):
         self.assertEqual(store.review_context(review_id)["messages"][0]["parts"][0]["text"], text)
 
     def test_config_failure_is_a_structured_learning_error(self):
-        self.settings("reports:\n  enabled: false\n")
         (self.home / "settings.yaml").write_text("llm:\n  apiKey: removed")
         output = io.StringIO()
         run(self.home, io.StringIO('{"version":1,"id":"hello","op":"hello","payload":{}}\n'), output)
@@ -208,6 +206,7 @@ class NativeCoreTests(unittest.TestCase):
         self.assertEqual(completed["result"]["outcome"], "cancelled")
         self.assertFalse((self.home / "skills" / "new-skill").exists())
         self.assertEqual(core.request("finish", "finish", {"reviewID": claimed["reviewID"], "text": '{"changes":[{"name":"new-skill","action":"create","content":"Use for a reusable procedure."}]}' }), completed)
+        self.assertFalse((self.home / "reports").exists())
 
     def test_host_usage_retains_unknown_and_normalized_zero(self):
         self.assertIsNone(host_usage({})["input_tokens"])
