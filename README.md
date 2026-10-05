@@ -1,94 +1,134 @@
 # Skill Learn Plugin
 
-An OpenCode plugin that reviews settled coding sessions and maintains a guarded skill library. OpenCode runs native fork/digest sessions and owns model authentication and tool preparation. A plugin-owned Python child keeps settings, SQLite, proposals, publication, sounds and offline HTML reports.
+## Introduction
 
-## Project locations
+An OpenCode V2 plugin that reviews settled coding conversations and turns reusable workflows into skills. It creates or improves agent-managed skills, publishing changes automatically or keeping proposals for approval. User-owned and pinned skills are protected.
 
-All source folders below are under `/opt/src/personal/agents/`:
+OpenCode handles reviewer sessions, models and authentication. A bundled Python child manages the queue, SQLite records, publication, sounds and offline reports. No separate HTTP service or provider credentials are needed.
 
-| Folder | Role |
-|---|---|
-| `skill-learn-plugin` | This project: the OpenCode V2 plugin and Python core |
-| `skill-learning-service` | Independent HTTP service; original starter source and schema/report reference |
-| `skill-learning` | Older implementation extracted from the memory project, with an OpenCode 1.x adapter |
-
-The plugin owns its implementation and has no shared runtime code or dependency on either sibling project. Its installed copy is separate: `~/.config/opencode/plugins/skill-learn/`, currently resolving to `/opt/src/personal/agents/harness/opencode/plugins/skill-learn/` on this machine.
-
-### Source layout
+## Source layout
 
 ```text
 install.sh                     Bash installer
-plugin/                        Native adapter and runtime npm manifests
-  server/                      Python project: pyproject.toml and skill_learn/
-tests/                         Adapter/Python/schema/report tests and fixture npm manifests
+plugin/                        OpenCode V2 adapter and runtime npm manifests
+  server/                      Python package and pyproject.toml
+    skill_learn/               Queue, storage, publication, CLI, reports and sounds
+tests/                         Python/adapter tests, schema fixtures and test npm manifests
 docs/settings.example.yaml     Configuration template
 ```
 
-`plugin/server/skill_learn/` implements the queue, storage, library/publication guards, management, notifications and reports. The adapter launches it as `python -m skill_learn`; the installer bundles it under `runtime/`. Only the review instruction is adapted from Hermes, with its MIT attribution retained.
+The installed package contains the adapter and a `runtime/` directory for Python. Runtime and test dependencies are separate; see [adapter details](plugin/README.md).
 
-`plugin/package.json` and its lockfile pin the shipped `@opencode/client@2.0.21` dependency. `tests/package.json` holds offline fixture dependencies. `node_modules/` is ignored at every depth; manifests and lockfiles belong in Git.
+## How to install
 
-## Install
-
-Requires Python **3.11+** with **PyYAML 6**, npm, and an OpenCode V2 managed service. The offline-verified service profiles are **2.0.6** and **2.0.21**; check `opencode api get /api/info`, since the CLI version can differ.
+Requires **Python 3.11+ with PyYAML 6**, **npm**, and an **OpenCode V2 managed service**, version **2.0.6** or **2.0.21**. Check the service with `opencode api get /api/info`, not the CLI version. Other versions and unregistered standalone/embedded hosts disable learning.
 
 ```bash
 ./install.sh
-# Explicit locations/interpreter:
-./install.sh --dest "$HOME/.config/opencode/plugins" \
-  --home "$HOME/.config/opencode/plugins/skill-learn" --python python3
+# Configure settings.yaml if needed, then load the plugin:
+opencode service restart
 ```
 
-`install.sh` is implemented in Bash and works from any working directory. It checks the selected Python runtime, stages pinned npm dependencies and bundled source, then replaces the old plugin. For options, run `./install.sh --help`.
+The default package and data home is `~/.config/opencode/plugins/skill-learn/`. The installer works from any working directory and accepts:
 
-Replacement keeps `settings.yaml` and database files (`*.sqlite`, `*.sqlite-*`, `*.db`, `*.db-*`), including SQLite sidecars and backups. All other old package contents are removed, including plugin-local skills, reports and operator files, before the new adapter/Python sources are copied. Dependencies are prepared before cleanup.
+| Option | Purpose |
+|---|---|
+| `--dest DIRECTORY` | Plugin discovery directory; defaults to `<OpenCode config>/plugins` |
+| `--home DIRECTORY` | Settings and data home; defaults to `<dest>/skill-learn` or `SKILL_LEARN_HOME` |
+| `--python EXECUTABLE` | Python interpreter; defaults to `python3` |
 
-The installer preserves existing settings and unrelated plugins. Plugin assets and state are installed under `plugins/skill-learn/`: the `index.js` entry, adapter helpers, pinned V2 client dependency, bundled Python, settings, databases, and reports. The skill library defaults to OpenCode's global skills folder. Its package exports only `index.js`, so the helpers are not discovered as separate plugins. **Restart the OpenCode service** after installation. When replacing another learner, disable its triggers before enabling this plugin.
+**Reinstallation retains only `settings.yaml` and database files** matching `*.sqlite`, `*.sqlite-*`, `*.db` and `*.db-*` (including sidecars/backups). Other old package contents are removed, including plugin-local skills and reports; relocate anything you need before reinstalling. Dependencies and Python imports are checked before cleanup. Unrelated plugins are preserved.
 
-The adapter uses V2's stable `skill-learn` ID and `setup` lifecycle. It discovers the existing service through the public authenticated client and verifies that its PID/version match the plugin host. Standalone/embedded hosts without that service registration are currently incompatible and disable learning with a diagnostic.
+Existing settings are preserved. The installer does not restart OpenCode. Disable other learner triggers when switching to this plugin. Usage: `./install.sh --help`.
 
-Default home: `~/.config/opencode/plugins/skill-learn/` (respecting `OPENCODE_CONFIG_DIR`/`XDG_CONFIG_HOME` and installation symlinks). Reinstallation preserves settings and database files. `--home` or `SKILL_LEARN_HOME` overrides it; a custom installer `--dest` defaults to `<dest>/skill-learn/`. Library/report paths resolve from the selected home; absolute paths and `~` work. The previous service's state and credentials are not imported.
+## Data storage
 
-### Database compatibility
+Records are stored locally in the selected home:
 
-`state.sqlite` has the same learning schema as `/opt/src/personal/agents/skill-learning-service`: `submissions`, `reviews`, `model_calls`, `evidence`, `proposals`, and `skill_registry`, with matching columns, types, defaults, and constraints. Both projects own independent implementations; the plugin has no imports, symlinks, or runtime dependency on the standalone service.
+| Location | Contents |
+|---|---|
+| `state.sqlite` | Submitted conversation snapshots, reviews, model calls/usage, evidence, proposals and skill registry |
+| `runtime.sqlite` | Execution leases, native reviewer identities, event deduplication, operation receipts and diagnostic probes |
+| `reports/` by default | Generated HTML reports and local evidence assets |
+| Configured skill library | Skill packages (`SKILL.md` and support files), stored on disk |
 
-Plugin-only leases, native identities, event deduplication, operation receipts, and probes live in adjacent `runtime.sqlite`. Back up both current databases together when retaining plugin state. Only the current V2 package layout and split schema are supported; V1/flat-layout upgrades and combined-schema conversion are removed. The standalone database is never modified.
+Back up **both databases together**. Reports can be regenerated. Legacy combined databases are rejected; only the current split schema is supported.
 
 ## Configuration
 
-See [`docs/settings.example.yaml`](docs/settings.example.yaml). Unknown/duplicate keys and invalid types disable learning with a diagnostic while ordinary chat remains usable.
+Edit `<home>/settings.yaml` using the [template](docs/settings.example.yaml), then restart the OpenCode service. Omitted options use defaults. Invalid types, unknown keys or duplicate YAML keys disable learning with a diagnostic.
 
-| Group | Important defaults |
+| Option | Default | Meaning |
+|---|---|---|
+| `runtime.python` | `python3` | Python child command; the installer's `--python` takes precedence |
+| `runtime.leaseSeconds` | `60` | Renewable execution lease, in seconds |
+| `triggers.idle` | `enabled: true`, `seconds: 15` | Submit after the configured idle interval |
+| `triggers.turns` | `enabled: true`, `count: 25` | Submit when idle after this many new observed user turns |
+| `llm.selection` | `follow` | Follow the parent model/variant, or use `configured` |
+| `llm.model` / `llm.variant` | `openai/gpt-5.5` / `medium` | Configured model and fallback for an unavailable parent selection; null variant uses the host default |
+| `llm.steps` | `16` | Maximum model calls per review |
+| `llm.contextWindow` | `null` | Fallback context-window size for budget calculation |
+| `review.contextMode` | `auto` | Choose fork/digest automatically, or force `digest` |
+| `review.maxForkInputTokens` | `120000` | Initial fork size guard; `null` disables it |
+| `review.maxInputTokens` | `null` | Next-call admission budget; see below |
+| `library.root` | `null` | OpenCode's global skills folder; an explicit path selects another library |
+| `approval.generated` | `auto` | Publish valid generated-skill changes; `manual` keeps proposals pending |
+| `approval.user` | `manual` | Accepts `manual`/`auto`; neither overrides user-owned skill protection |
+| `notifications.enabled` / `notifications.volume` | `true` / `1` | Lifecycle sounds; volume 0–1, with 0 muting playback |
+| `notifications.types` | All `true` | Individual switches for `initiated`, `started`, `finished`, `unchanged`, `failed` and `cancelled` |
+| `reports.enabled` / `reports.root` | `true` / `reports` | Enable reports and select their directory |
+
+**Paths:** OpenCode config resolves from `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then `~/.config/opencode`. Missing/null `library.root` uses its global `skills/` folder. Explicit library/report paths resolve from the plugin home unless absolute; `~` and symlinks work. `library.root: skills` selects `<home>/skills/` and is preserved on reinstall.
+
+**Budgets:** null `review.maxInputTokens` uses 75% of the known context window, or 120000 when unknown; positive integers override it, zero/negative disables it. A call finishes normally, but reaching the budget blocks the next call. Fork size and call-count limits are separate.
+
+**Environment:** `SKILL_LEARN_HOME` overrides the default installation/CLI home; `--home` takes precedence. `SKILL_LEARNING_NOTIFICATIONS=0` mutes sounds; `1` enables them, subject to per-cue switches and volume.
+
+## Behaviour
+
+1. **Trigger when idle.** Wait for the idle interval, or submit immediately when idle after the turn threshold. Resuming work cancels the timer. Either trigger can be disabled.
+2. **Queue a snapshot.** Unchanged transcripts are skipped; renames update display information. Subagents are recorded but not reviewed. Internal reviewers cannot trigger recursive learning.
+3. **Review one at a time per home.** A native **fork** inherits the parent conversation and compatible settings. A **digest** summarizes history in a fresh session when forced, when the parent model/profile cannot be preserved, or when the initial fork size guard fails.
+4. **Extract changes.** Reviewers may load skills, but cannot execute other tools. Historical tool calls are evidence. Python validates the final feedback and publishes or stages proposals according to `approval.generated`.
+5. **Protect skills.** New skills carry `metadata.origin: generated`. Reviews refuse edits to user-owned, pinned or protected skills and refuse whole-skill deletion. `adopt` explicitly transfers a skill to agent management. Support files stay under `references/`, `templates/` or `scripts/`; patches must match uniquely. Approval checks current file hashes before staged publication.
+6. **Recover without replay.** New submissions supersede older work for the same parent, cancelling only its reviewer. Recovery reconnects to retained sessions and collects completed results once. Missing/ambiguous execution or interrupted publication is reconciled, not automatically replayed. Reviewer retries and auxiliary model calls are blocked.
+
+Reports refresh after terminal reviews and management changes. Lifecycle sounds use bundled JennyNeural recordings, played locally without overlap or runtime TTS. A WAV player such as `paplay`, `pw-play` or `ffplay` is required. Sound/report failures do not change review outcomes.
+
+The skill catalogue and loaded bodies remain a snapshot until restart; Python validates writes against current files. Missing runtime dependencies disable learning without stopping ordinary chat.
+
+## Other information
+
+### Management and reports
+
+Run commands from the installed runtime using the selected Python interpreter:
+
+```bash
+cd "$HOME/.config/opencode/plugins/skill-learn/runtime"
+python3 -m skill_learn pending
+python3 -m skill_learn report
+```
+
+Adjust the path for custom installations. Put `--home PATH` before the command to select another store. `python3 -m pip install ./plugin/server` optionally installs the equivalent `skill-learn` console command.
+
+| Command | Purpose |
 |---|---|
-| `runtime` | `python: python3`, 60-second execution lease |
-| `triggers` | 15 idle seconds; 25 user turns. Either trigger can be disabled |
-| `llm` | `selection: follow`, configured fallback `openai/gpt-5.5` / `variant: medium`, 16 calls |
-| `review` | `contextMode: auto`; first-fork limit 120000; next-call input limit derived from context |
-| `library` | Optional `root`; omitted or `null` uses OpenCode's global skills folder |
-| `approval` | Generated skills auto; user-owned manual. User settings never authorize background edits |
-| `notifications` | Enabled, volume 1; individual initiated/started/finished/unchanged/failed/cancelled switches |
-| `reports` | Enabled under `reports/` |
+| `pending` | List pending skill proposals |
+| `show ID` | Inspect a review, proposal or diagnostic probe |
+| `approve PROPOSAL_ID` / `reject PROPOSAL_ID` | Apply or reject a pending proposal |
+| `adopt SKILL_NAME` | Mark an existing skill as agent-managed |
+| `pin SKILL_NAME` / `unpin SKILL_NAME` | Protect or release a skill from background edits |
+| `report` | Regenerate the HTML report and print its index path |
+| `delete-session opencode SESSION_ID` | Remove learning history; retain skills, coding sessions and minimal reviewer identities |
+| `reconcile REVIEW_ID --state abandoned` | Settle interrupted work after confirming its native execution has stopped |
 
-`configured` uses the configured model/variant through OpenCode. A different pair, unavailable/incompatible parent profile, forced digest or oversized/unassessable fork selects a fresh digest session. Digests contain role-labeled historical evidence, not executable historical tool calls.
+Stop/reconcile active reviews before deleting their history. Other recovery states: `reconcile --help`; `--state finished` requires a `--result` file with the final review text.
 
-`review.maxInputTokens: null` means 75% of a known selected context window, or 120000 when unknown. A positive integer sets the previous-call budget; zero/negative disables it. A call reaching the budget finishes before the next is blocked. `maxForkInputTokens: null` disables the separate initial size guard. `llm.steps` still caps calls. No Python provider fallback exists.
-
-Omit `library`, omit its `root`, or set `library.root: null` to read and publish skills under `~/.config/opencode/skills/`. `OPENCODE_CONFIG_DIR` takes precedence over `XDG_CONFIG_HOME`, and skill-folder symlinks are resolved. This fallback is independent of the plugin home. Explicit paths keep their existing behavior: relative paths resolve from the plugin home, and absolute paths/`~` work. Existing `root: skills` settings still select the plugin-local library; reinstall preserves them.
-
-## Library and review behavior
-
-Reviews can load skills through the existing `skill` tool; other tools cannot execute for internal reviewers. Python applies final JSON feedback. Generated packages carry `metadata.origin: generated`; user-owned, pinned, bundled/hub/external packages and bare deletes are refused. Patches must match uniquely. Manual approval checks the saved base hash. Complete package publication is staged before replacement.
-
-OpenCode's skill catalogue and bodies are an **instance snapshot until restart**. Old bodies and newly published names not yet available are accepted; learning is not restart-gated. Python reads and validates current files before publication/approval. Inherited skill bodies remain in native fork history.
-
-Duplicate transcript watermarks do not run again. Renames update display metadata. Newer work cancels only that parent's review; coding parents are never aborted. Delegates are stored as not reviewed. Durable internal identities prevent recursive reviews, including after restart or record deletion.
-
-One review executes per home across instances. V2 prompt admission is followed by native completion waiting. Interrupted work is reconciled with its native session; ambiguous execution/publication is retained for operator reconciliation, never blindly replayed. Internal model retries and auxiliary model requests are vetoed so they cannot bypass call admission; ordinary parent policy is unchanged. A missing Python/helper disables learning without stopping ordinary chat.
+Open the reported `index.html` for **Summary**, **Review sessions** and **Skills & proposals**, with filters and expandable evidence. Reports work offline after OpenCode exits and have no editing controls. Failed generation preserves the previous complete report.
 
 ### Background-session metadata
 
-Every reviewer carries this persistent `Session.Info.metadata` contract:
+Reviewers carry persistent `Session.Info.metadata` for other plugins:
 
 ```json
 {
@@ -102,69 +142,31 @@ Every reviewer carries this persistent `Session.Info.metadata` contract:
 }
 ```
 
-Digest sessions receive it at creation. Forks are marked immediately after creation, preserving unrelated metadata; persistence is checked before binding and every prompt. Recovery restores markers for retained reviewer identities, including terminal/deleted learning records. Renaming does not change the marker or the inherited agent/profile.
+Markers are verified before prompts and restored during recovery, independently of titles. Consumers must honor these flags; OpenCode does not enforce them. They do not change permissions or mute this plugin's lifecycle cues.
 
-These flags are a plugin contract, not built-in OpenCode switches. Audio observers must check `metadata.automation.suppressAudio === true` before all notification paths. Memory collectors must check `metadata.automation.suppressMemoryCollection === true` before tracking, capture, dispatch and shutdown, and clear queued/cached work when a session becomes marked. Observe `session.metadata.updated` (`event.data.metadata`) and resolve uncached sessions with `session.get`; V2 forks can have `fork.sessionID` without `parentID`. Suppression does not grant tool permissions or require memory replay. The operator reports memory plugins now consume the memory flag; their implementation/validation is managed separately.
+### Tests and diagnostics
 
-## Commands and reports
-
-The bundled runtime supports management without a separate package install:
-
-```bash
-cd "$HOME/.config/opencode/plugins/skill-learn/runtime"
-python3 -m skill_learn report
-```
-
-Use the interpreter selected with `--python` and the actual installed path if overridden. To get the optional `skill-learn` console command, run `python3 -m pip install ./plugin/server`. The commands below also work as `python3 -m skill_learn` from the bundled runtime; use `--home PATH` before the command for a non-default store:
-
-```bash
-skill-learn pending
-skill-learn show rv_REVIEW_ID
-skill-learn approve sp_PROPOSAL_ID
-skill-learn reject sp_PROPOSAL_ID
-skill-learn adopt skill-name
-skill-learn pin skill-name
-skill-learn unpin skill-name
-skill-learn report
-skill-learn delete-session opencode ses_SESSION_ID
-# After confirming its host execution has stopped:
-skill-learn reconcile rv_REVIEW_ID --state abandoned
-```
-
-Open the reported `index.html` using a file URL. The report matches the standalone dashboard's **Summary**, **Review sessions**, and **Skills & proposals** views, styling, counts, filters, and change summaries. Published skills, pending proposals, and history-only changes stay distinct. Session → review → call grouping loads complete available evidence inline when a call is expanded, with retry and review-detail links. Reports work after OpenCode exits; section navigation and on-demand evidence assets are local files. No listener, fetch, external assets or browser publication controls are used. Management and terminal reviews refresh snapshots; failed generation preserves the last complete report. Active work must be cancelled/reconciled before deletion. Deletion preserves skill files, coding sessions and minimal internal identity tombstones.
-
-Usage is labeled **host-normalized**: uncached input plus cache read/write. Missing host fields remain unknown; partial totals stay partial. The pinned host converts provider omissions to zero, so original provider counter availability/raw usage is unavailable. Final HTTP bodies/response IDs are unavailable; requested/observed host evidence is retained instead. First-call and continuation cache reuse are separate observations, not proof of full conversation-prefix reuse.
-
-Notifications use bundled **JennyNeural** voice recordings, matching user-memory's voice and loudness. Playback is local through PulseAudio/PipeWire or a compatible WAV player; no runtime TTS/network dependency. Voice cues are serialized within the core to avoid overlapping speech. `SKILL_LEARNING_NOTIFICATIONS=0` mutes sounds; zero volume also mutes. Playback failures are evidence, not review failures. See [recording details](plugin/server/skill_learn/sounds/README.md).
-
-## Verification
-
-Offline suites (no model/provider calls):
+Offline tests from the checkout root (no provider calls):
 
 ```bash
 PYTHONPATH="$PWD/plugin/server" python3 -m unittest discover -s tests
-# Fixture dependencies only:
 npm ci --ignore-scripts --prefix tests
 node --test tests/*.test.mjs
 ```
 
-V2 source fixtures read unpacked `@opencode/core` releases from `/tmp/opencode/skill-learn-v2-fixtures/<version>/package/` for 2.0.6 and 2.0.21. Set `OPENCODE_V2_FIXTURES` to another fixture root. External-source tests are skipped when their checkout or fixtures are absent.
+Optional 2.0.6/2.0.21 fixtures: `/tmp/opencode/skill-learn-v2-fixtures/<version>/package/`, overridden by `OPENCODE_V2_FIXTURES`. Missing fixtures skip those tests. Browser checks require `google-chrome`. See [adapter verification](plugin/README.md).
 
-Chrome file-URL checks run when `google-chrome` is available. V2 fixtures execute released host conversion/usage functions and the corresponding native `@opencode/ai` protocol lowering, with a fake public-client transport. See [adapter evidence](plugin/README.md).
-
-**Explicit live diagnostic**, with OpenCode running and an idle learning queue:
+Live cache/latency diagnostics make provider calls. Run from the installed runtime with OpenCode running and an idle parent/queue:
 
 ```bash
-skill-learn cache-probe ses_SETTLED_PARENT_ID --mode fork
-skill-learn show probe_REQUEST_ID
-# Separate digest comparison:
-skill-learn cache-probe ses_SETTLED_PARENT_ID --mode digest
+python3 -m skill_learn cache-probe ses_PARENT_ID --mode fork
+python3 -m skill_learn show probe_REQUEST_ID
+# Request a separate comparison if needed:
+python3 -m skill_learn cache-probe ses_PARENT_ID --mode digest
 ```
 
-Each request permits at most two provider calls and 8192 assessed input tokens per call, no tool execution/publication and no automatic paid retry. Unknown/oversized assessment refuses dispatch. Inspect the recorded review for counts and latency; low/missing cache reuse remains unresolved acceptance evidence. Live cache and operator cutover acceptance are separate from offline tests.
+Each request permits at most two calls and 8192 assessed input tokens per call, without tools, publication or retry. Unknown/oversized input refuses dispatch. Usage is **host-normalized**: absent host fields remain unknown, but provider omissions may become zero. Raw provider usage/wire bodies are unavailable; cache counts do not prove full parent-prefix reuse.
 
-### Deployment status
+### Attribution and recordings
 
-The installed folder layout, schema split and report parity were verified earlier. The optional global-library fallback, project-layout/Bash/V2-only cleanup and reviewer metadata are source updates; they have not been deployed. Installed settings retain explicit `library.root: skills`, selecting the plugin-local library. Skill-learn deployment and sound relocation remain cancelled; cues stay bundled with Python. The authorized audio-plugin files are updated in the harness installation, without a service restart or live-activation claim. Live provider cache/latency and supported-host cutover/restart/rollback acceptance remain pending.
-
-The Hermes-adapted skill-only instruction retains its MIT attribution: Copyright (c) 2025 Nous Research, `NousResearch/hermes-agent` revision `f42f579cf8bac4918ac9599bece71618afadd846`. Cursor and other adapters are deferred.
+The review instruction is adapted from `NousResearch/hermes-agent` revision `f42f579cf8bac4918ac9599bece71618afadd846`, retaining its MIT attribution: Copyright (c) 2025 Nous Research. Bundled audio details are in the [recordings README](plugin/server/skill_learn/sounds/README.md).
