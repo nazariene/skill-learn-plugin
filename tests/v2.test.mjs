@@ -22,7 +22,7 @@ async function eventually(condition) {
 function hostFixture(directory, version) {
   const sessions = new Map(), history = new Map(), active = {}, requests = [], hooks = new Map(), skills = new Map()
   const events = [], pending = new Map()
-  let wake, sequence = 0, held = false, duringCall = async () => {}
+  let wake, sequence = 0, held = false, steps = 1, duringCall = async () => {}
   const emit = (type, data, location = { directory }) => {
     events.push({ type, data, location }); wake?.(); wake = undefined
   }
@@ -75,21 +75,37 @@ function hostFixture(directory, version) {
       requests.push(["wait", { sessionID }])
       if (!active[sessionID]) return
       const state = sessions.get(sessionID), transcript = history.get(sessionID)
-      const context = { sessionID, agent: state.agent, model: state.model,
-        system: [{ type: "text", text: "Native host system", providerMetadata: { test: "retained" } }],
-        messages: [], tools: { skill: { description: "Load a skill", input: { type: "object", properties: { id: { type: "string" } } } }, shell: { description: "Shell", input: {} } }, options: { maxTokens: 1000 } }
       try {
-        await callHook("session", "context", context)
-        const assistant = { id: `assistant_${++sequence}`, type: "assistant", agent: state.agent, model: state.model, content: [], time: { created: sequence } }
-        transcript.push(assistant)
-        emit("session.step.started", { sessionID, assistantMessageID: assistant.id })
-        const headers = { sessionID, agent: state.agent, model: state.model, kind: "primary", headers: { "x-session-affinity": version === "2.0.6" ? sessionID : state.fork?.sessionID || sessionID, Authorization: "host-secret" } }
-        await callHook("session", "model.request", headers)
-        if (state.fork) assert.equal(headers.headers["x-session-affinity"], state.fork.sessionID)
-        await duringCall(sessionID, context)
-        if (held) await new Promise(resolve => pending.set(sessionID, resolve))
-        assistant.content = [{ type: "text", text: "Nothing to save." }]; assistant.finish = "stop"; assistant.tokens = tokens; assistant.time.completed = ++sequence
-        emit("session.step.ended", { sessionID, assistantMessageID: assistant.id })
+        for (let step = 0; step < steps; step++) {
+          const context = { sessionID, agent: state.agent, model: state.model,
+            system: [{ type: "text", text: "Native host system", providerMetadata: { test: "retained" } }],
+            messages: [], tools: { skill: { description: "Load a skill", input: { type: "object", properties: { id: { type: "string" } } } }, shell: { description: "Shell", input: {} } }, options: { maxTokens: 1000 } }
+          await callHook("session", "context", context)
+          const assistant = { id: `assistant_${++sequence}`, type: "assistant", agent: state.agent, model: state.model, content: [], time: { created: sequence } }
+          transcript.push(assistant)
+          emit("session.step.started", { sessionID, assistantMessageID: assistant.id })
+          const headers = { sessionID, agent: state.agent, model: state.model, kind: "primary", headers: { "x-session-affinity": version === "2.0.6" ? sessionID : state.fork?.sessionID || sessionID, Authorization: "host-secret" } }
+          await callHook("session", "model.request", headers)
+          if (state.fork) assert.equal(headers.headers["x-session-affinity"], state.fork.sessionID)
+          await duringCall(sessionID, context)
+          if (held) await new Promise(resolve => pending.set(sessionID, resolve))
+          if (step + 1 < steps) {
+            await callHook("tool", "execute.before", { sessionID, tool: "skill" })
+            const result = { content: [{ type: "text", text: "Procedure body" }], metadata: { directory: resolve(directory, "skills/procedure") } }
+            await callHook("tool", "execute.after", { sessionID, tool: "skill", input: { id: "procedure" }, status: "completed", result })
+            assistant.content = [{ type: "tool", id: `call_${sequence}`, name: "skill", state: { status: "completed", input: { id: "procedure" }, content: result.content } }]
+            assistant.finish = "tool-calls"
+          } else {
+            assistant.content = [{ type: "text", text: "Nothing to save." }]; assistant.finish = "stop"
+          }
+          assistant.tokens = tokens; assistant.time.completed = ++sequence
+          emit("session.step.ended", { sessionID, assistantMessageID: assistant.id })
+        }
+        transcript.push({ id: `idle_${++sequence}`, type: "idle", outcome: "succeeded" })
+      } catch (error) {
+        // Released Session.wait awaits idle; execution failures arrive through events/history.
+        transcript.push({ id: `idle_${++sequence}`, type: "idle", outcome: "failed" })
+        emit("session.execution.failed", { sessionID, error: { type: "unknown", message: error.message } })
       } finally { delete active[sessionID]; pending.delete(sessionID) }
     },
     interrupt: async input => { requests.push(["interrupt", input]); delete active[input.sessionID]; pending.get(input.sessionID)?.() },
@@ -129,7 +145,7 @@ function hostFixture(directory, version) {
   }
   parent()
   return { ctx, client, sessions, history, skills, hooks, requests, emit, parent, callHook, pending,
-    set held(value) { held = value }, set duringCall(value) { duringCall = value } }
+    set held(value) { held = value }, set steps(value) { steps = value }, set duringCall(value) { duringCall = value } }
 }
 
 async function fixture(t, version = "2.0.24", settings = "") {
@@ -442,6 +458,67 @@ test("V2 native reviewer guards preserve parent execution and record only the re
   const load = f.operations.find(entry => entry.op === "skill-loaded").payload
   assert.equal(load.body, "Old snapshot body")
   assert.equal(load.discoveryCompatible, true)
+})
+
+test("V2 skill-loading continuation admits and records each model call before collecting a final answer", async t => {
+  const f = await fixture(t)
+  mkdirSync(resolve(f.home, "skills/procedure"), { recursive: true })
+  f.host.steps = 2
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "unchanged", JSON.stringify(finished))
+  const review = await f.core.request("show", { id: finished.payload.reviewID })
+  assert.equal(review.calls.length, 2)
+  assert.ok(review.calls.every(call => call.call_status === "completed"))
+  assert.equal(review.calls[0].response.tool_calls[0].tool, "skill")
+  assert.equal(review.calls[1].response.content, "Nothing to save.")
+  assert.equal(f.operations.filter(entry => entry.op === "admit" && entry.answer.allowed).length, 2)
+  assert.equal(f.host.requests.filter(([op]) => op === "prompt").length, 1)
+})
+
+test("V2 marked but unbound reviewers fail closed before model admission", async t => {
+  const f = await fixture(t)
+  f.host.parent("unbound-reviewer")
+  f.host.sessions.get("unbound-reviewer").metadata = { automation: { owner: "skill-learn", kind: "skill-review", reviewID: "rv_missing" } }
+  await assert.rejects(f.observe("unbound-reviewer"), /no durable review binding/)
+  await assert.rejects(f.host.callHook("session", "generate", { sessionID: "unbound-reviewer" }), /no durable review binding/)
+  await assert.rejects(f.host.callHook("tool", "execute.before", { sessionID: "unbound-reviewer", tool: "shell" }), /no durable review binding/)
+  const title = { sessionID: "unbound-reviewer" }
+  await f.host.callHook("session", "title", title)
+  assert.equal(title.result, "Skill review")
+  assert.equal(f.operations.some(entry => entry.op === "admit"), false)
+  await f.observe()
+})
+
+test("V2 refresh discovers a retained reviewer but cannot admit another activation's paid call", async t => {
+  const f = await fixture(t)
+  const claim = f.operations.find(entry => entry.op === "claim").payload
+  const queued = await f.core.request("enqueue", { harness: "opencode", hostID: claim.hostID, hostPID: process.pid,
+    sessionID: "parent", watermark: "foreign-owner", messages: [] })
+  await f.core.request("claim", { hostID: claim.hostID, owner: "foreign-owner" })
+  await f.core.request("bind", { reviewID: queued.reviewId, reviewerID: "foreign-reviewer", owner: "foreign-owner", inheritedIDs: [] })
+  f.host.parent("foreign-reviewer")
+  f.host.sessions.get("foreign-reviewer").metadata = { automation: { owner: "skill-learn", kind: "skill-review", reviewID: queued.reviewId } }
+  await assert.rejects(f.observe("foreign-reviewer"), /another plugin activation/)
+  assert.equal(f.operations.some(entry => entry.op === "admit"), false)
+  assert.equal((await f.core.request("show", { id: queued.reviewId })).status, "running")
+  await f.core.request("cancel", { reviewID: queued.reviewId, hostSettled: true })
+})
+
+test("V2 execution failure after a skill step retains the real error rather than parsing empty feedback", async t => {
+  const f = await fixture(t)
+  mkdirSync(resolve(f.home, "skills/procedure"), { recursive: true })
+  f.host.steps = 2
+  let calls = 0
+  f.host.duringCall = async () => { if (++calls === 2) throw new Error("Synthetic continuation failed") }
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "failed")
+  assert.match(finished.answer.error, /Synthetic continuation failed|execution failed before a final answer/)
+  assert.equal(finished.answer.error.includes("Expecting value"), false)
+  const review = await f.core.request("show", { id: finished.payload.reviewID })
+  assert.equal(review.calls[0].response.tool_calls[0].tool, "skill")
+  assert.equal(review.calls[1].call_status, "interrupted")
 })
 
 test("V2 diagnostic continuation records two separate calls and then stops", async t => {

@@ -200,6 +200,32 @@ test("wired native fork, inherited event exclusion, host evidence and restart id
   assert.equal(f.host.requests.filter(([op]) => op === "prompt").length, 1)
 })
 
+test("a replacement activation stops stale polling and uses its own review admission owner", async t => {
+  const f = await fixture(t)
+  const stalePoll = [...f.timers.timers].find(timer => timer.delay === 5000)
+  const secondCore = new ChildCore({ home: f.home }), timers = timerQueue(), operations = []
+  const wrapped = { get closed() { return secondCore.closed }, dispose: () => secondCore.dispose(), request: async (...args) => {
+    const answer = await secondCore.request(...args); operations.push({ op: args[0], payload: args[1], answer }); return answer
+  } }
+  const second = await createPlugin({ client: f.host.client, directory: f.home, serverUrl: "http://fake-host" }, { home: f.home }, { core: wrapped, ...timers, hostVersion })
+  t.after(async () => { await second.dispose(); await secondCore.dispose() })
+  assert.equal(f.core.closed, true)
+  assert.equal(f.timers.timers.size, 0)
+  const oldOperations = f.operations.length
+  await f.hooks.event({ event: { type: "session.idle", properties: { sessionID: "parent" } } })
+  stalePoll.callback()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(f.operations.length, oldOperations)
+  f.host.hooks = second
+  await second.config({})
+  await settle({ hooks: second, host: f.host, timers })
+  const finished = await eventually(() => operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "unchanged")
+  assert.equal(operations.filter(entry => entry.op === "admit").length, 1)
+  assert.equal(operations.find(entry => entry.op === "admit").payload.owner, operations.find(entry => entry.op === "bind").payload.owner)
+  assert.equal(f.host.requests.filter(([op]) => op === "prompt").length, 1)
+})
+
 test("same-parent supersession aborts reviewer only and keeps independent queued work", async t => {
   const f = await fixture(t)
   f.host.held = true
@@ -420,9 +446,15 @@ test("a live unbound claim is retained, ambiguous recovery is surfaced, missing 
   const queued = await f.core.request("enqueue", { harness: "opencode", hostID: claim.hostID, hostPID: process.pid, sessionID: "parent", watermark: "saved", messages: [] })
   await f.core.request("claim", { hostID: claim.hostID, owner: "lost-owner" })
   const secondCore = new ChildCore({ home: f.home }), timers = timerQueue()
-  const second = await createPlugin({ client: f.host.client, directory: f.home, serverUrl: "http://fake-host" }, { home: f.home }, { core: secondCore, ...timers, hostVersion })
+  const recordingCore = { get closed() { return secondCore.closed }, dispose: () => secondCore.dispose(), request: async (...args) => {
+    const answer = await secondCore.request(...args); f.operations.push({ op: args[0], payload: args[1], answer }); return answer
+  } }
+  const second = await createPlugin({ client: f.host.client, directory: f.home, serverUrl: "http://fake-host" }, { home: f.home }, { core: recordingCore, ...timers, hostVersion })
+  t.after(async () => { await second.dispose(); await secondCore.dispose() })
+  assert.equal(f.core.closed, true)
+  Object.assign(f, { core: secondCore, hooks: second, timers })
+  f.host.hooks = second
   assert.equal((await f.core.request("show", { id: queued.reviewId })).status, "running")
-  await second.dispose(); await secondCore.dispose()
   await f.core.request("bind", { reviewID: queued.reviewId, reviewerID: "saved-native", owner: "lost-owner", inheritedIDs: [] })
   f.host.sessions.set("saved-native", { id: "saved-native" }); f.host.histories.set("saved-native", [])
   const status = f.host.client.session.status

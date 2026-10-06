@@ -28,6 +28,8 @@ Requires **Python 3.11+ with PyYAML 6**, **npm**, and an **OpenCode V2 managed s
 
 Startup errors dispose the worker and fail plugin activation, so OpenCode reports **failed**, not **active**. Ordinary parent sessions remain usable.
 
+Configuration reload replaces the previous learner for the same host/location. Old timers and workers stop before the replacement starts; in-flight internal reviews are cancelled, not replayed. Execution failures and tool-only endings remain failures rather than being parsed as final feedback.
+
 ```bash
 ./install.sh
 # Configure settings.yaml if needed, then load the plugin:

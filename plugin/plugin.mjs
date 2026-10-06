@@ -9,6 +9,8 @@ const AUXILIARY = new Set(["title", "summary", "compaction", "user-memory-collec
 const hash = value => createHash("sha256").update(JSON.stringify(value)).digest("hex")
 const sessionIDOf = event => event.properties?.sessionID || event.properties?.info?.sessionID || event.properties?.part?.sessionID || (event.type?.startsWith("session.") ? event.properties?.info?.id : undefined)
 const alive = pid => { try { if (!Number.isInteger(pid)) return null; process.kill(pid, 0); return true } catch (error) { return error.code === "ESRCH" ? false : null } }
+// Reloaded locations can outlive their hooks until an active step settles.
+const activations = globalThis[Symbol.for("skill-learn.activations")] ||= new Map()
 
 export async function createPlugin(input, options = {}, dependencies = {}) {
   const diagnostic = dependencies.diagnostic || (message => console.error(`skill-learn: ${message}`))
@@ -24,7 +26,8 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
   const hostID = hash([String(input.serverUrl || "in-process"), input.directory, dependencies.pid ?? process.pid])
   const hostScope = hash([String(input.serverUrl || "in-process"), input.directory])
   const hostPID = dependencies.pid ?? process.pid
-  let child, settings, disposed = false, disabled = false, pumping = false, pumpAgain = false
+  const activationID = hash([home, hostID])
+  let child, settings, poll, disposed = false, disabled = false, pumping = false, pumpAgain = false
   const reviewers = new Map(), states = new Map(), buffered = []
   const setTimer = dependencies.setTimer || setTimeout
   const clearTimer = dependencies.clearTimer || clearTimeout
@@ -38,7 +41,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
   async function abortOwned() {
     const settled = new Set()
     for (const [id, review] of reviewers) {
-      if (review.hostID !== hostID || review.terminal) continue
+      if (review.hostID !== hostID || review.owner !== owner || review.terminal) continue
       try { await abortSettled(id); settled.add(id) } catch (error) { diagnostic(error.message) }
     }
     return settled
@@ -53,6 +56,10 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
   try {
     if (!supportedHostVersion(profiles.hostVersion)) throw new Error("Unsupported OpenCode V2 service version")
     if (Object.keys(options).some(key => !["home", "python"].includes(key))) throw new Error("Unknown skill-learn plugin option")
+    const previous = activations.get(activationID)
+    activations.set(activationID, dispose)
+    await previous?.()
+    if (disposed) throw new Error("Skill learning startup was superseded by another activation")
     child = dependencies.core || startCore({ home, python: options.python || "python3", diagnostic,
       onFailure: () => { disabled = true; background(abortOwned()) } })
     settings = await child.request("hello")
@@ -63,6 +70,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
     }
     await preload()
   } catch (error) {
+    if (activations.get(activationID) === dispose) activations.delete(activationID)
     await child?.dispose?.()
     throw error
   }
@@ -92,7 +100,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
     for (const row of saved.reviewers) {
       if (reviewers.has(row.reviewer_id)) continue
       const plan = JSON.parse(row.plan_json || "{}")
-      reviewers.set(row.reviewer_id, { ...plan, reviewID: row.id, hostID: row.host_id, hostPID: row.host_pid,
+      reviewers.set(row.reviewer_id, { ...plan, reviewID: row.id, owner: row.owner, hostID: row.host_id, hostPID: row.host_pid,
         state: "preparing", terminal: row.status !== "running", inherited: new Set(JSON.parse(row.inherited_json || "[]")),
         attempts: new Map(), pendingCalls: [], seenSteps: new Set(), seenParts: new Map() })
       try {
@@ -195,7 +203,10 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
       const messages = await recordSnapshot(id)
       const last = messages.findLast(message => message.info.role === "assistant")
       const text = (last?.parts || []).filter(part => part.type === "text").map(part => part.text).join("\n")
-      const error = review.stopReason || (last?.info?.error ? JSON.stringify(last.info.error) : !last?.info?.finish ? "Native reviewer interrupted before a terminal result" : undefined)
+      const idle = messages.findLast(message => message.native?.type === "idle")
+      const error = review.stopReason || (idle?.native.outcome === "failed" ? "Native reviewer execution failed before a final answer" :
+        last?.info?.error ? JSON.stringify(last.info.error) : !last?.info?.finish ? "Native reviewer interrupted before a terminal result" :
+        last.info.finish === "tool-calls" ? "Native reviewer ended after tool calls without a final answer" : undefined)
       const payload = { reviewID: review.reviewID, text, messages, error }
       if (cancelled) await child.request("cancel", { reviewID: review.reviewID, hostSettled: true })
       else await child.request(reconcileState ? "reconcile" : "finish", { ...payload, ...(reconcileState ? { state: "finished" } : {}) })
@@ -221,7 +232,10 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
       }
       const statuses = responseData(await input.client.session.status({ query: { directory: input.directory }, throwOnError: true }))
       if (statuses[row.reviewer_id]?.type && statuses[row.reviewer_id].type !== "idle") {
-        if (row.host_id === hostID) await child.request("reconcile", { reviewID: row.id, state: "active", owner })
+        if (row.host_id === hostID) {
+          await child.request("reconcile", { reviewID: row.id, state: "active", owner })
+          review.owner = owner
+        }
         return
       }
       // Reconnect to a finished native session without prompting it again.
@@ -268,7 +282,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
       try {
         id = await native.prepare(plan)
         const registered = reviewers.get(id)
-        Object.assign(registered, { hostID, hostPID, inherited: new Set(), attempts: new Map(), pendingCalls: [], seenSteps: new Set(), seenParts: new Map() })
+        Object.assign(registered, { owner, hostID, hostPID, inherited: new Set(), attempts: new Map(), pendingCalls: [], seenSteps: new Set(), seenParts: new Map() })
         const saved = await child.request("state", { hostID })
         registered.inherited = new Set(JSON.parse(saved.reviewers.find(row => row.reviewer_id === id)?.inherited_json || "[]"))
         while (buffered.length) await processEvent(buffered.shift())
@@ -309,6 +323,9 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
     if (!id || disposed) return
     const review = reviewers.get(id)
     if (review) {
+      if (event.type === "session.idle" && event.properties?.error && !review.terminal) {
+        review.stopReason ||= event.properties.error.message || JSON.stringify(event.properties.error)
+      }
       if (event.type === "session.status" && event.properties?.status?.type === "retry" && review.diagnostic) review.retryBlocked = true
       // The prompt promise owns normal completion. Restart reconciliation owns
       // abandoned completion; idle events never create another submission.
@@ -332,18 +349,18 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
   async function dispose() {
     if (disposed) return
     disposed = true
+    if (activations.get(activationID) === dispose) activations.delete(activationID)
     clearTimer(poll)
     for (const state of states.values()) disarm(state)
     const settled = await abortOwned()
-    if (!child.closed) {
+    if (child && !child.closed) {
       for (const [id, review] of reviewers) if (settled.has(id) && !review.terminal) {
         await child.request("cancel", { reviewID: review.reviewID, hostSettled: true }).catch(error => diagnostic(error.message))
       }
     }
-    await child.dispose?.()
+    await child?.dispose?.()
   }
 
-  let poll
   function schedulePoll() {
     if (disposed || disabled) return
     poll = setTimer(() => { background(pump().finally(schedulePoll)) }, Math.min(5000, settings.leaseSeconds * 500))
@@ -383,6 +400,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
         return
       }
       if (disposed || disabled || review.state !== "ready" || review.terminal || review.hostID !== hostID || AUXILIARY.has(hookInput.agent)) throw new Error("Internal reviewer call is not eligible")
+      if (review.owner !== owner) throw new Error("Internal reviewer belongs to another plugin activation")
       if (review.model?.variant && !(review.model.variant in (hookInput.model?.variants || {}))) throw new Error(`Unsupported host variant: ${review.model.variant}`)
       if (review.retryBlocked) throw new Error("Diagnostic provider retries are disabled")
       try {
@@ -428,6 +446,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
     },
     "native.skills": () => child.request("host-skills"),
     "native.internal": id => reviewers.has(id),
+    "native.refresh": preload,
     "native.invalidate": id => profiles.parents.delete(id),
   }
 }

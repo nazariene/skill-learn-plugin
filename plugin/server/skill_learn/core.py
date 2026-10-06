@@ -301,6 +301,8 @@ class Core:
         try:
             if payload.get("error"):
                 raise SkillServiceError(payload["error"])
+            if not text:
+                raise SkillServiceError("Native reviewer returned no final answer")
             if plan.get("diagnostic"):
                 self.store.add_evidence(row["id"], "cache-diagnostic", {"probeID": plan["probeID"], "publication": False, "calls": len(self.store.model_calls_for_review(row["id"])), "acceptance": "unresolved; host counts do not establish full parent-history reuse", "text": text})
             elif text != "Nothing to save.":

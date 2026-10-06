@@ -115,6 +115,15 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(self.request("reconcile", reviewID=next_review, state="finished", text="Nothing to save.")["settled"], True)
         self.assertEqual(len(self.core.store.model_calls_for_review(review)), 1)
 
+    def test_empty_completion_preserves_execution_error_and_never_publishes(self):
+        for error in (None, "Review stopped: review-not-active"):
+            with self.subTest(error=error):
+                review = self.job(parent=str(error), watermark=str(error))
+                finished = self.request("finish", reviewID=review, text="", error=error)
+                self.assertEqual(finished["outcome"], "failed")
+                self.assertEqual(finished["error"], error or "Native reviewer returned no final answer")
+                self.assertEqual(list(self.core.library.root.glob("*/SKILL.md")), [])
+
     def test_result_publication_once_and_internal_tombstone_after_delete(self):
         review = self.job()
         feedback = json.dumps({"changes": [{"name": "procedure", "action": "create", "content": "Use for repeated work."}]})

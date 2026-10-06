@@ -7,6 +7,7 @@ const fingerprint = value => createHash("sha256").update(JSON.stringify(value)).
 const generationKeys = ["temperature", "topP", "topK", "maxTokens"]
 const nativeDefaultKeys = new Set([...generationKeys, "baseURL", "apiKey", "transport"])
 const textContent = content => typeof content === "string" ? content : (content || []).filter(part => part.type === "text").map(part => part.text).join("\n")
+const isReviewSession = session => session?.metadata?.automation?.owner === "skill-learn" && session.metadata.automation.kind === "skill-review"
 
 // This projection is core/report evidence only. Native fork and prompt never
 // send it back to OpenCode as inherited model history.
@@ -118,14 +119,24 @@ export async function setupV2(ctx, options = {}, dependencies = {}) {
     } }
     hooks = await createPlugin({ client, directory, serverUrl: connection.url, hostVersion: ctx.app.version },
       { ...ctx.options, ...options }, { ...dependencies, hostVersion: ctx.app.version, diagnostic, metadataUpdates: ctx.app.version !== "2.0.6" })
+    const ensureReviewer = async (sessionID, session) => {
+      if (hooks["native.internal"](sessionID)) return true
+      session ||= await ctx.session.get({ sessionID })
+      if (!isReviewSession(session)) return false
+      await hooks["native.refresh"]()
+      if (!hooks["native.internal"](sessionID)) throw new Error("Internal reviewer has no durable review binding")
+      return true
+    }
     const skills = await hooks["native.skills"]()
     registrations.push(await ctx.skill.transform(editor => {
       for (const skill of skills) if (!editor.get(skill.id)) editor.add(skill)
     }))
     registrations.push(await ctx.session.hook("context", async event => {
-      const internal = hooks["native.internal"](event.sessionID)
+      let internal = hooks["native.internal"](event.sessionID)
+      let session
       try {
-        const session = await readSession(event.sessionID)
+        session = await readSession(event.sessionID)
+        internal = await ensureReviewer(event.sessionID, session)
         const observed = await registry({ ...session, agent: event.agent, model: event.model })
         const history = await messages(event.sessionID)
         const latest = profileAnchor(history)
@@ -150,23 +161,34 @@ export async function setupV2(ctx, options = {}, dependencies = {}) {
           if (value !== undefined) event.options[key] = value
         }
       } catch (error) {
-        if (internal) throw error
+        if (internal || isReviewSession(session)) throw error
         hooks["native.invalidate"](event.sessionID)
         diagnostic(`parent profile unavailable: ${error.message}`)
       }
     }))
     registrations.push(await ctx.session.hook("model.request", async event => {
       if (event.kind !== "primary") return
+      await ensureReviewer(event.sessionID)
       await hooks["chat.headers"](event, event)
     }))
-    registrations.push(await ctx.session.hook("retry", event => hooks["native.retry"](event)))
-    for (const kind of ["compaction", "generate"]) registrations.push(await ctx.session.hook(kind, event => hooks["native.auxiliary"](event)))
-    registrations.push(await ctx.session.hook("title", event => {
-      try { hooks["native.auxiliary"](event) } catch { event.result = "Skill review" }
+    registrations.push(await ctx.session.hook("retry", async event => {
+      await ensureReviewer(event.sessionID)
+      hooks["native.retry"](event)
     }))
-    registrations.push(await ctx.tool.hook("execute.before", event => hooks["tool.execute.before"](event)))
+    for (const kind of ["compaction", "generate"]) registrations.push(await ctx.session.hook(kind, async event => {
+      await ensureReviewer(event.sessionID)
+      hooks["native.auxiliary"](event)
+    }))
+    registrations.push(await ctx.session.hook("title", async event => {
+      try { await ensureReviewer(event.sessionID); hooks["native.auxiliary"](event) } catch { event.result = "Skill review" }
+    }))
+    registrations.push(await ctx.tool.hook("execute.before", async event => {
+      await ensureReviewer(event.sessionID)
+      await hooks["tool.execute.before"](event)
+    }))
     registrations.push(await ctx.tool.hook("execute.after", async event => {
       if (event.status !== "completed" || event.tool !== "skill") return
+      await ensureReviewer(event.sessionID)
       await hooks["tool.execute.after"]({ ...event, args: { name: event.input?.id } },
         { metadata: { ...event.result.metadata, dir: event.result.metadata?.directory }, output: textContent(event.result.content) })
     }))
