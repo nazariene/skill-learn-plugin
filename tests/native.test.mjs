@@ -102,6 +102,19 @@ test("fresh digest submits evidence as text, never historical native tool action
   assert.deepEqual(host.requests.find(([op]) => op === "prompt")[1].body.parts, [{ type: "text", text: reviewPlan.instruction }])
 })
 
+test("a creation-only metadata host rejects forks without creating an unmarked reviewer", async () => {
+  const host = fakeHost(), adapter = new NativeReviews({ ...host, directory: "/workspace", metadataUpdates: false })
+  await assert.rejects(adapter.prepare(plan()), /digest is required/)
+  assert.deepEqual(host.requests, [])
+  const digest = { ...plan(), mode: "digest", agent: "build" }
+  const id = await adapter.prepare(digest)
+  await adapter.prompt(id, digest)
+  assert.equal(host.requests.some(([op, request]) => op === "update" && request.body.metadata), false)
+  host.sessions.get(id).metadata.automation.suppressAudio = false
+  await assert.rejects(adapter.prompt(id, digest), /cannot update reviewer suppression metadata/)
+  assert.equal(host.requests.filter(([op]) => op === "prompt").length, 1)
+})
+
 test("changed parent, failed binding and SDK errors cannot dispatch", async () => {
   const host = fakeHost(), adapter = new NativeReviews({ ...host, directory: "/workspace", bind: async () => { throw new Error("binding failed") } })
   await assert.rejects(adapter.prepare({ ...plan(), watermark: "old" }), /transcript changed/)
@@ -189,6 +202,25 @@ test("unpreservable scopes, stale profiles, changed agent/model and unknown opti
   await observe(profiles, { apiKey: "credential", schema: { parse: () => {} } })
   assert.equal(profiles.compatibility(session, raw, selected).reason, "unpreservable-provider-options")
   assert.equal(JSON.stringify(profiles.parents.get("parent")).includes("credential"), false)
+})
+
+test("a completed checkpoint establishes a new profile boundary and requires fresh request headers", async () => {
+  const profiles = new ParentProfiles({ hostVersion }), { hooks, input } = await observe(profiles)
+  const selected = { providerID: "openai", modelID: "gpt-5.5", variant: "medium" }
+  const checkpoint = { info: { id: "checkpoint", role: "assistant", summary: true }, parts: [], native: { type: "compaction", status: "completed" } }
+  const messages = [...raw, checkpoint, { info: { id: "reminder", role: "user", synthetic: true }, parts: [] }]
+  assert.equal(profiles.compatibility(parent, messages, selected).reason, "parent-profile-stale")
+  const current = { ...input, message: checkpoint.info }
+  await hooks["experimental.chat.system.transform"](current, { system: ["Current context instructions"] })
+  await hooks["chat.params"](current, { options: {} })
+  assert.equal(profiles.compatibility(parent, messages, selected).reason, "parent-profile-unavailable")
+  await hooks["chat.headers"](current, { headers: { "x-session-affinity": "parent" } })
+  assert.equal(profiles.compatibility(parent, messages, selected).compatible, true)
+  assert.deepEqual(profiles.parents.get("parent").system, ["Current context instructions"])
+  const pending = { info: { id: "incomplete", role: "compaction" }, parts: [], native: { type: "compaction", status: "pending" } }
+  assert.equal(profiles.compatibility(parent, [...messages, pending], selected).compatible, true)
+  const user = { info: { id: "new-user", role: "user" }, parts: [] }
+  assert.equal(profiles.compatibility(parent, [...messages, user], selected).reason, "parent-profile-stale")
 })
 
 test("a session creation version cannot establish the running host version", async () => {

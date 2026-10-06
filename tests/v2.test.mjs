@@ -43,15 +43,21 @@ function hostFixture(directory, version) {
   const session = {
     hook: hook("session"),
     get: async ({ sessionID }) => { if (!sessions.has(sessionID)) throw Error("not found"); return structuredClone(sessions.get(sessionID)) },
-    context: async ({ sessionID }) => structuredClone(history.get(sessionID)),
+    context: async ({ sessionID }) => {
+      requests.push(["context", { sessionID }])
+      const messages = history.get(sessionID)
+      const boundary = messages.findLastIndex(message => message.type === "compaction" && message.status === "completed")
+      return structuredClone(messages.slice(Math.max(0, boundary)))
+    },
     create: async input => {
       const id = `review_${++sequence}`
       sessions.set(id, { id, title: input.title, metadata: input.metadata, agent: "build", model: selection, location: input.location, permissions: [] }); history.set(id, [])
       requests.push(["create", input]); return structuredClone(sessions.get(id))
     },
     update: async input => {
-      Object.assign(sessions.get(input.sessionID), Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)))
-      requests.push(["update", input])
+      const allowed = version === "2.0.24" ? ["title", "metadata", "permissions"] : ["title", "permissions"]
+      Object.assign(sessions.get(input.sessionID), Object.fromEntries(Object.entries(input).filter(([key, value]) => allowed.includes(key) && value !== undefined)))
+      requests.push(["context-update", input])
     },
     switchAgent: async input => { sessions.get(input.sessionID).agent = input.agent; requests.push(["agent", input]) },
     switchModel: async input => { sessions.get(input.sessionID).model = input.model; requests.push(["model", input]) },
@@ -90,6 +96,11 @@ function hostFixture(directory, version) {
   }
   const client = { server: { info: async () => ({ version, pid: process.pid }) }, session: {
     active: async () => structuredClone(active),
+    update: async input => {
+      if (version === "2.0.6" && input.metadata !== undefined) throw Error("Metadata updates are not supported")
+      Object.assign(sessions.get(input.sessionID), Object.fromEntries(Object.entries(input).filter(([key, value]) => ["title", "metadata", "permissions"].includes(key) && value !== undefined)))
+      requests.push(["update", input])
+    },
     fork: async input => {
       const id = `review_${++sequence}`
       requests.push(["fork", input])
@@ -121,19 +132,25 @@ function hostFixture(directory, version) {
     set held(value) { held = value }, set duringCall(value) { duringCall = value } }
 }
 
-async function fixture(t, version = "2.0.21", settings = "") {
+async function fixture(t, version = "2.0.24", settings = "") {
   const home = mkdtempSync("/tmp/opencode/skill-v2-")
   writeFileSync(resolve(home, "settings.yaml"), "library:\n  root: skills\nnotifications:\n  enabled: false\ntriggers:\n  idle:\n    seconds: 0\n" + settings)
-  const host = hostFixture(home, version), core = new ChildCore({ home }), operations = [], timers = new Set(), diagnostics = []
-  const wrapped = { get closed() { return core.closed }, dispose: () => core.dispose(), request: async (...args) => {
-    const answer = await core.request(...args); operations.push({ op: args[0], payload: args[1], answer }); return answer
-  } }
-  const stop = await setupV2(host.ctx, { home }, { core: wrapped, diagnostic: value => diagnostics.push(value),
-    connection: { discover: async () => ({ url: "http://own-host" }), makeClient: () => host.client },
-    setTimer: (callback, delay) => { const timer = { callback, delay, unref() {} }; timers.add(timer); return timer }, clearTimer: timer => timers.delete(timer) })
+  const host = hostFixture(home, version), operations = [], timers = new Set(), diagnostics = []
+  let core, stop
+  const start = async () => {
+    core = new ChildCore({ home })
+    const current = core, claims = operations.filter(entry => entry.op === "claim").length
+    const wrapped = { get closed() { return current.closed }, dispose: () => current.dispose(), request: async (...args) => {
+      const answer = await current.request(...args); operations.push({ op: args[0], payload: args[1], answer }); return answer
+    } }
+    stop = await setupV2(host.ctx, { home }, { core: wrapped, diagnostic: value => diagnostics.push(value),
+      connection: { discover: async () => ({ url: "http://own-host" }), makeClient: () => host.client },
+      setTimer: (callback, delay) => { const timer = { callback, delay, unref() {} }; timers.add(timer); return timer }, clearTimer: timer => timers.delete(timer) })
+    assert.equal(typeof stop, "function", diagnostics.join("\n"))
+    await eventually(() => operations.filter(entry => entry.op === "claim").length > claims)
+  }
   t.after(async () => { await stop?.(); await core.dispose(); rmSync(home, { recursive: true, force: true }) })
-  assert.equal(typeof stop, "function", diagnostics.join("\n"))
-  await eventually(() => operations.some(entry => entry.op === "claim"))
+  await start()
   const fire = delay => { for (const timer of [...timers]) if (timer.delay === delay) { timers.delete(timer); timer.callback() } }
   const observe = async (id = "parent", options = {}) => {
     await host.callHook("session", "context", { sessionID: id, agent: "build", model: selection,
@@ -146,10 +163,11 @@ async function fixture(t, version = "2.0.21", settings = "") {
     host.emit("session.execution.succeeded", { sessionID: id })
     await eventually(() => [...timers].some(timer => timer.delay === 0)); fire(0)
   }
-  return { home, host, core, operations, diagnostics, fire, observe, settle, stop }
+  return { home, host, get core() { return core }, operations, diagnostics, fire, observe, settle,
+    stop: () => stop(), restart: async () => { await stop(); await start() } }
 }
 
-for (const version of V2_HOST_VERSIONS) test(`V2 ${version} fork preserves native history, waits for completion and maps host calls`, async t => {
+for (const version of V2_HOST_VERSIONS.filter(version => version !== "2.0.6")) test(`V2 ${version} fork preserves native history, waits for completion and maps host calls`, async t => {
   const f = await fixture(t, version)
   f.host.sessions.get("parent").metadata = { operator: "retained", automation: { customPolicy: "retained" } }
   await f.observe(); await f.settle()
@@ -164,6 +182,7 @@ for (const version of V2_HOST_VERSIONS) test(`V2 ${version} fork preserves nativ
   } })
   assert.deepEqual(f.host.sessions.get("parent").metadata, { operator: "retained", automation: { customPolicy: "retained" } })
   assert.deepEqual(f.host.history.get(bound.reviewerID).slice(0, 2), f.host.history.get("parent"))
+  assert.equal(f.host.requests.some(([op]) => op === "context-update"), false)
   const review = await f.core.request("show", { id: finished.payload.reviewID })
   assert.equal(review.calls.length, 1)
   assert.equal(review.calls[0].call_status, "completed")
@@ -175,6 +194,181 @@ for (const version of V2_HOST_VERSIONS) test(`V2 ${version} fork preserves nativ
   f.host.emit("session.idle", { sessionID: bound.reviewerID })
   await f.observe()
   assert.equal(f.operations.filter(entry => entry.op === "enqueue").length, 1)
+})
+
+for (const version of V2_HOST_VERSIONS) test(`V2 ${version} post-compaction continuation uses a freshly observed checkpoint profile`, async t => {
+  const f = await fixture(t, version)
+  await f.observe()
+  const history = f.host.history.get("parent")
+  history[1].tokens = { ...tokens, input: 250000 }
+  const checkpoint = { id: "checkpoint", type: "compaction", status: "completed", summary: "Current checkpoint summary",
+    recent: "Retained recent tool evidence", providerContext: { opaque: "host-owned checkpoint" } }
+  const continued = { id: "continued", type: "assistant", agent: "build", model: selection,
+    time: { created: 4, completed: 5 }, finish: "stop", tokens, content: [{ type: "text", text: "Continued after compaction" }] }
+  history.push(checkpoint, continued)
+  await f.observe()
+  f.host.duringCall = async id => {
+    if (version !== "2.0.6") {
+      const active = await f.host.ctx.session.context({ sessionID: id })
+      assert.deepEqual(active[0], checkpoint)
+      assert.equal(active.some(message => message.id === "parent_user"), false)
+    } else {
+      const prompt = f.host.requests.find(([op]) => op === "prompt")[1].text
+      assert.match(prompt, /Current checkpoint summary[\s\S]*Retained recent tool evidence[\s\S]*Continued after compaction/)
+      assert.equal(prompt.includes("Fix the reusable ordering rule"), false)
+    }
+  }
+  await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "unchanged", JSON.stringify(finished))
+  const queued = f.operations.find(entry => entry.op === "enqueue").payload
+  assert.deepEqual(queued.messages.map(message => message.info.id), ["checkpoint", "continued"])
+  assert.deepEqual(queued.messages[0].native, checkpoint)
+  assert.equal(queued.profile.turnID, "checkpoint")
+  assert.equal(queued.compatibility.compatible, version !== "2.0.6")
+  assert.equal(queued.parentInputTokens, tokens.input)
+  const review = await f.core.request("show", { id: finished.payload.reviewID })
+  assert.equal(review.context_mode, version === "2.0.6" ? "digest" : "fork")
+  assert.equal(f.host.requests.filter(([op]) => op === "fork").length, version === "2.0.6" ? 0 : 1)
+  assert.equal(f.host.requests.filter(([op]) => op === "messages").length, 0)
+})
+
+test("V2 2.0.6 uses marked digest sessions without attempting unsupported fork metadata updates", async t => {
+  const f = await fixture(t, "2.0.6")
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "unchanged", JSON.stringify(finished))
+  const review = await f.core.request("show", { id: finished.payload.reviewID })
+  assert.equal(review.context_mode, "digest")
+  assert.equal(JSON.parse(review.decision_json).reason, "reviewer-metadata-update-unavailable")
+  assert.equal(f.host.requests.some(([op]) => op === "fork"), false)
+  assert.equal(f.host.requests.some(([op, input]) => op === "update" && input.metadata), false)
+  assert.equal(f.host.requests.find(([op]) => op === "create")[1].metadata.automation.suppressAudio, true)
+})
+
+for (const version of V2_HOST_VERSIONS) test(`V2 ${version} unmarked retained reviewers cannot disable startup or trigger recursive learning`, async t => {
+  const f = await fixture(t, version)
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  const bound = f.operations.find(entry => entry.op === "bind").payload
+  const session = f.host.sessions.get(bound.reviewerID)
+  session.title = "Renamed old reviewer"
+  session.metadata = { operator: "retained", automation: { unrelated: "retained" } }
+  const promptCount = f.host.requests.filter(([op]) => op === "prompt").length
+  const updateCount = f.host.requests.filter(([op]) => op === "update").length
+  await f.restart()
+  assert.equal(f.diagnostics.some(value => value.includes("learning disabled")), false, f.diagnostics.join("\n"))
+  assert.equal(session.title, "Renamed old reviewer")
+  if (version === "2.0.6") {
+    assert.deepEqual(session.metadata, { operator: "retained", automation: { unrelated: "retained" } })
+    assert.equal(f.host.requests.filter(([op]) => op === "update").length, updateCount)
+  } else {
+    assert.deepEqual(session.metadata, { operator: "retained", automation: { unrelated: "retained",
+      owner: "skill-learn", kind: "skill-review", reviewID: finished.payload.reviewID, suppressAudio: true, suppressMemoryCollection: true } })
+  }
+  f.host.emit("session.execution.succeeded", { sessionID: session.id })
+  f.host.parent("after-restart")
+  await f.observe("after-restart"); await f.settle("after-restart")
+  await eventually(() => f.operations.filter(entry => entry.op === "finish").length === 2)
+  assert.equal(f.operations.filter(entry => entry.op === "enqueue").length, 2)
+  assert.equal(f.host.requests.filter(([op]) => op === "prompt").length, promptCount + 1)
+  assert.equal(f.host.requests.some(([op]) => op === "context-update"), false)
+})
+
+test("V2 HTTP metadata persistence is still required before binding or prompting a fork", async t => {
+  const f = await fixture(t)
+  const update = f.host.client.session.update
+  f.host.client.session.update = async input => {
+    if (input.metadata) return
+    return update(input)
+  }
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.match(finished.payload.error, /persist reviewer suppression metadata/)
+  assert.equal(f.operations.some(entry => entry.op === "bind"), false)
+  assert.equal(f.host.requests.some(([op]) => op === "prompt"), false)
+})
+
+for (const phase of ["preload", "registration"]) test(`V2 ${phase} failure rejects activation and cleans up its worker and registrations`, async t => {
+  const home = mkdtempSync("/tmp/opencode/skill-v2-startup-")
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  const host = hostFixture(home, "2.0.24"), diagnostics = [], timers = new Set()
+  let closed = false
+  const core = { get closed() { return closed }, dispose: async () => { closed = true }, request: async op => {
+    if (op === "hello") return { libraryRoot: resolve(home, "library"), leaseSeconds: 30 }
+    if (op === "host-skills") return []
+    assert.equal(op, "state")
+    return { reviewers: phase === "preload" ? [{ id: "rv_old", reviewer_id: "old-reviewer", status: "finished" }] : [] }
+  } }
+  if (phase === "preload") {
+    host.parent("old-reviewer")
+    host.client.session.update = async () => {}
+  } else {
+    const hook = host.ctx.session.hook
+    host.ctx.session.hook = (name, callback) => {
+      if (name === "retry") throw new Error("Registration unavailable")
+      return hook(name, callback)
+    }
+  }
+  await assert.rejects(setupV2(host.ctx, { home }, { core, diagnostic: value => diagnostics.push(value),
+    connection: { discover: async () => ({ url: "http://own-host" }), makeClient: () => host.client },
+    setTimer: callback => { timers.add(callback); return callback }, clearTimer: callback => timers.delete(callback) }),
+  phase === "preload" ? /persist reviewer suppression metadata/ : /Registration unavailable/)
+  assert.equal(closed, true)
+  assert.equal(timers.size, 0)
+  assert.equal(host.skills.size, 0)
+  assert.ok([...host.hooks.values()].every(callbacks => callbacks.length === 0))
+  assert.equal(host.requests.some(([op]) => op === "prompt" || op === "fork"), false)
+  assert.equal(diagnostics.filter(value => value.startsWith("learning disabled:")).length, 1)
+  assert.equal(host.sessions.get("parent").title, "Ordering investigation")
+})
+
+for (const version of V2_HOST_VERSIONS) test(`V2 ${version} digest captures only the latest completed checkpoint and subsequent evidence`, async t => {
+  const f = await fixture(t, version, "review:\n  contextMode: digest\n")
+  f.host.history.get("parent").push(
+    { id: "old_checkpoint", type: "compaction", status: "completed", summary: "EXCLUDED_OLD_CHECKPOINT" },
+    { id: "old_user", type: "user", text: "EXCLUDED_OLD_USER", time: { created: 4 } },
+    { id: "checkpoint", type: "compaction", status: "completed", summary: "CURRENT_SUMMARY", recent: "RETAINED_RECENT_CONTEXT" },
+    { id: "current_user", type: "user", text: "CURRENT_USER_REQUEST", time: { created: 5 } },
+    { id: "current_assistant", type: "assistant", agent: "build", model: selection, finish: "stop", tokens,
+      time: { created: 6, completed: 7 }, content: [{ type: "tool", id: "lookup", name: "read", state: {
+        status: "completed", input: { path: "current-file" }, content: [{ type: "text", text: "CURRENT_TOOL_RESULT" }] } }] },
+    { id: "incomplete_checkpoint", type: "compaction", status: "failed" },
+  )
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "unchanged")
+  const queued = f.operations.find(entry => entry.op === "enqueue").payload
+  assert.deepEqual(queued.messages.map(message => message.info.id), ["checkpoint", "current_user", "current_assistant", "incomplete_checkpoint"])
+  assert.equal(queued.profile.turnID, "current_user")
+  const prompt = f.host.requests.find(([op]) => op === "prompt")[1].text
+  for (const text of ["CURRENT_SUMMARY", "RETAINED_RECENT_CONTEXT", "CURRENT_USER_REQUEST", "CURRENT_TOOL_RESULT"]) assert.ok(prompt.includes(text), text)
+  for (const text of ["EXCLUDED_OLD_CHECKPOINT", "EXCLUDED_OLD_USER", "Fix the reusable ordering rule"]) assert.equal(prompt.includes(text), false, text)
+  assert.equal(f.host.requests.filter(([op]) => op === "messages").length, 0)
+})
+
+test("V2 an unrefreshed pre-compaction profile cannot override the current model selection", async t => {
+  const f = await fixture(t)
+  await f.observe()
+  const current = { ...selection, id: "current-model", variant: "high" }
+  f.host.sessions.get("parent").model = current
+  f.host.ctx.model.list = async () => ({ data: [model, { ...model, id: current.id, variants: [{ id: "high", settings: { reasoningEffort: "high" } }] }] })
+  f.host.history.get("parent").push(
+    { id: "checkpoint", type: "compaction", status: "completed", summary: "Current context" },
+    { id: "continued", type: "assistant", agent: "build", model: current, finish: "stop", tokens,
+      time: { created: 4, completed: 5 }, content: [{ type: "text", text: "Completed current context" }] },
+  )
+  await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "unchanged", JSON.stringify(finished))
+  const queued = f.operations.find(entry => entry.op === "enqueue").payload
+  assert.equal(queued.compatibility.reason, "parent-profile-stale")
+  assert.deepEqual(queued.profile.model, { providerID: current.providerID, modelID: current.id })
+  assert.equal(queued.profile.variant, "high")
+  const review = await f.core.request("show", { id: finished.payload.reviewID })
+  assert.equal(review.context_mode, "digest")
+  assert.equal(review.called_model, "openai/current-model")
+  assert.equal(f.host.requests.filter(([op]) => op === "fork").length, 0)
 })
 
 test("V2 discovery rejects another server and unsupported service versions before startup", async () => {

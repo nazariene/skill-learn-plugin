@@ -10,6 +10,7 @@ OpenCode handles reviewer sessions, models and authentication. A bundled Python 
 
 ```text
 install.sh                     Bash installer
+report.sh                      Generate an offline report using live settings
 plugin/                        OpenCode V2 adapter and runtime npm manifests
   server/                      Python package and pyproject.toml
     skill_learn/               Queue, storage, publication, CLI, reports and sounds
@@ -21,7 +22,11 @@ The installed package contains the adapter and a `runtime/` directory for Python
 
 ## How to install
 
-Requires **Python 3.11+ with PyYAML 6**, **npm**, and an **OpenCode V2 managed service**, version **2.0.6** or **2.0.21**. Check the service with `opencode api get /api/info`, not the CLI version. Other versions and unregistered standalone/embedded hosts disable learning.
+Requires **Python 3.11+ with PyYAML 6**, **npm**, and an **OpenCode V2 managed service**, version **2.0.6**, **2.0.21** or **2.0.24**. Check the service with `opencode api get /api/info`, not the CLI version. Other versions and unregistered standalone/embedded hosts disable learning.
+
+**2.0.6 uses digest reviews** because it cannot update a fork's suppression metadata. **2.0.21/2.0.24 support native forks** through their authenticated metadata-update API.
+
+Startup errors dispose the worker and fail plugin activation, so OpenCode reports **failed**, not **active**. Ordinary parent sessions remain usable.
 
 ```bash
 ./install.sh
@@ -62,14 +67,14 @@ Edit `<home>/settings.yaml` using the [template](docs/settings.example.yaml), th
 |---|---|---|
 | `runtime.python` | `python3` | Python child command; the installer's `--python` takes precedence |
 | `runtime.leaseSeconds` | `60` | Renewable execution lease, in seconds |
-| `triggers.idle` | `enabled: true`, `seconds: 15` | Submit after the configured idle interval |
+| `triggers.idle` | `enabled: true`, `seconds: 120` | Submit after the configured idle interval |
 | `triggers.turns` | `enabled: true`, `count: 25` | Submit when idle after this many new observed user turns |
 | `llm.selection` | `follow` | Follow the parent model/variant, or use `configured` |
 | `llm.model` / `llm.variant` | `openai/gpt-5.5` / `medium` | Configured model and fallback for an unavailable parent selection; null variant uses the host default |
 | `llm.steps` | `16` | Maximum model calls per review |
 | `llm.contextWindow` | `null` | Fallback context-window size for budget calculation |
 | `review.contextMode` | `auto` | Choose fork/digest automatically, or force `digest` |
-| `review.maxForkInputTokens` | `120000` | Initial fork size guard; `null` disables it |
+| `review.maxForkInputTokens` | `250000` | Initial fork size guard; `null` disables it |
 | `review.maxInputTokens` | `null` | Next-call admission budget; see below |
 | `library.root` | `null` | OpenCode's global skills folder; an explicit path selects another library |
 | `approval.generated` | `auto` | Publish valid generated-skill changes; `manual` keeps proposals pending |
@@ -87,8 +92,8 @@ Edit `<home>/settings.yaml` using the [template](docs/settings.example.yaml), th
 ## Behaviour
 
 1. **Trigger when idle.** Wait for the idle interval, or submit immediately when idle after the turn threshold. Resuming work cancels the timer. Either trigger can be disabled.
-2. **Queue a snapshot.** Unchanged transcripts are skipped; renames update display information. Subagents are recorded but not reviewed. Internal reviewers cannot trigger recursive learning.
-3. **Review one at a time per home.** A native **fork** inherits the parent conversation and compatible settings. A **digest** summarizes history in a fresh session when forced, when the parent model/profile cannot be preserved, or when the initial fork size guard fails.
+2. **Queue the active context.** A completed compaction starts a new review boundary: capture its checkpoint and subsequent messages through OpenCode's context API. Unchanged context is skipped; renames update display information. Subagents are recorded but not reviewed. Internal reviewers cannot trigger recursive learning.
+3. **Review one at a time per home.** A native **fork** inherits the parent's active context and compatible settings. Profile freshness follows the latest real user turn, or the checkpoint when continuing immediately after compaction. A **digest** summarizes that active context in a fresh session when forced, when the parent model/profile cannot be preserved, or when the initial fork size guard fails.
 4. **Extract changes.** Reviewers may load skills, but cannot execute other tools. Historical tool calls are evidence. Python validates the final feedback and publishes or stages proposals according to `approval.generated`.
 5. **Protect skills.** New skills carry `metadata.origin: generated`. Reviews refuse edits to user-owned, pinned or protected skills and refuse whole-skill deletion. `adopt` explicitly transfers a skill to agent management. Support files stay under `references/`, `templates/` or `scripts/`; patches must match uniquely. Approval checks current file hashes before staged publication.
 6. **Recover without replay.** New submissions supersede older work for the same parent, cancelling only its reviewer. Recovery reconnects to retained sessions and collects completed results once. Missing/ambiguous execution or interrupted publication is reconciled, not automatically replayed. Reviewer retries and auxiliary model calls are blocked.
@@ -101,12 +106,19 @@ The skill catalogue and loaded bodies remain a snapshot until restart; Python va
 
 ### Management and reports
 
+Generate a report directly from the checkout:
+
+```bash
+./report.sh
+```
+
+The script works from any working directory, uses the repository's Python code and the installed plugin's settings/databases, and prints the generated index path. `reports.root` selects the output directory. Options: `--home DIRECTORY`, `--python EXECUTABLE`; `SKILL_LEARN_HOME` and OpenCode config-directory overrides also apply. Python 3.11+ and PyYAML 6 are required; OpenCode need not be running.
+
 Run commands from the installed runtime using the selected Python interpreter:
 
 ```bash
 cd "$HOME/.config/opencode/plugins/skill-learn/runtime"
 python3 -m skill_learn pending
-python3 -m skill_learn report
 ```
 
 Adjust the path for custom installations. Put `--home PATH` before the command to select another store. `python3 -m pip install ./plugin/server` optionally installs the equivalent `skill-learn` console command.
@@ -126,6 +138,8 @@ Stop/reconcile active reviews before deleting their history. Other recovery stat
 
 Open the reported `index.html` for **Summary**, **Review sessions** and **Skills & proposals**, with filters and expandable evidence. Reports work offline after OpenCode exits and have no editing controls. Run `report` again for an updated snapshot. Failed generation reports an error and preserves the previous complete report.
 
+Parent transcripts are stored once in local evidence assets and loaded only when expanded. Complete raw records remain available; large records use compact JSON during generation.
+
 ### Background-session metadata
 
 Reviewers carry persistent `Session.Info.metadata` for other plugins:
@@ -142,7 +156,7 @@ Reviewers carry persistent `Session.Info.metadata` for other plugins:
 }
 ```
 
-Markers are verified before prompts and restored during recovery, independently of titles. Consumers must honor these flags; OpenCode does not enforce them. They do not change permissions or mute this plugin's lifecycle cues.
+Markers are verified before prompts and restored during recovery where the host supports metadata updates, independently of titles. On 2.0.6, new digest sessions are marked at creation; older completed reviewers remain excluded by their stored identities without blocking startup. Consumers must honor these flags; OpenCode does not enforce them. They do not change permissions or mute this plugin's lifecycle cues.
 
 ### Tests and diagnostics
 
@@ -154,7 +168,7 @@ npm ci --ignore-scripts --prefix tests
 node --test tests/*.test.mjs
 ```
 
-Optional 2.0.6/2.0.21 fixtures: `/tmp/opencode/skill-learn-v2-fixtures/<version>/package/`, overridden by `OPENCODE_V2_FIXTURES`. Missing fixtures skip those tests. Browser checks require `google-chrome`. See [adapter verification](plugin/README.md).
+Optional 2.0.6/2.0.21/2.0.24 fixtures: `/tmp/opencode/skill-learn-v2-fixtures/<version>/package/`, overridden by `OPENCODE_V2_FIXTURES`. Missing fixtures skip those tests. Browser checks require `google-chrome`. See [adapter verification](plugin/README.md).
 
 Live cache/latency diagnostics make provider calls. Run from the installed runtime with OpenCode running and an idle parent/queue:
 

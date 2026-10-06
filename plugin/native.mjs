@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 
-export const V2_HOST_VERSIONS = Object.freeze(["2.0.6", "2.0.21"])
+export const V2_HOST_VERSIONS = Object.freeze(["2.0.6", "2.0.21", "2.0.24"])
 export const supportedHostVersion = version => V2_HOST_VERSIONS.includes(version)
 
 export function reviewMetadata(reviewID, metadata = {}) {
@@ -24,6 +24,13 @@ export function responseData(response) {
 export function transcriptWatermark(messages) {
   // Display metadata is deliberately outside the transcript identity.
   return createHash("sha256").update(JSON.stringify(messages)).digest("hex")
+}
+
+export function profileAnchor(messages) {
+  // A completed checkpoint anchors continuations until the next real user turn.
+  return messages.findLast(message =>
+    (message.native?.type === "compaction" && message.native.status === "completed") ||
+    (message.info.role === "user" && !message.info.synthetic))?.info
 }
 
 export async function readMessages(client, directory, sessionID) {
@@ -107,7 +114,7 @@ export class ParentProfiles {
         try {
           const observed = portableOptions(output.options)
           this.parents.set(input.sessionID, {
-            ...this.parents.get(input.sessionID),
+            system: this.parents.get(input.sessionID)?.system,
             fidelity: "host_observed", hostVersion: this.hostVersion,
             turnID: input.message?.id, agent: input.agent,
             model: { providerID: input.model?.providerID, modelID: input.model?.id },
@@ -146,11 +153,11 @@ export class ParentProfiles {
 
   compatibility(session, messages, selected, { agent = selected.agent, restorePermission = true } = {}) {
     const profile = this.parents.get(session.id)
-    const latest = messages.findLast(message => message.info.role === "user" && !message.info.synthetic)?.info
+    const latest = profileAnchor(messages)
     if (!profile?.system?.length || !profile.headers) return { compatible: false, reason: "parent-profile-unavailable" }
     if (!supportedHostVersion(this.hostVersion)) return { compatible: false, reason: "unsupported-host-version" }
     if (!profile.agent || !profile.model.providerID || !profile.model.modelID) return { compatible: false, reason: "parent-profile-incomplete" }
-    if (profile.turnID !== latest?.id) return { compatible: false, reason: "parent-profile-stale" }
+    if (!latest?.id || profile.turnID !== latest.id) return { compatible: false, reason: "parent-profile-stale" }
     if (profile.unavailableOptions.length) return { compatible: false, reason: "unpreservable-provider-options" }
     if (profile.unavailableDefaults?.length) return { compatible: false, reason: "unpreservable-request-defaults" }
     if (!profile.registryFingerprint || profile.registryFingerprint !== session.registryFingerprint) return { compatible: false, reason: "parent-registry-changed" }
@@ -168,11 +175,12 @@ export class ParentProfiles {
 }
 
 export class NativeReviews {
-  constructor({ client, directory, reviewers = new Map(), bind = async () => {} }) {
+  constructor({ client, directory, reviewers = new Map(), bind = async () => {}, metadataUpdates = true }) {
     this.client = client
     this.directory = directory
     this.reviewers = reviewers
     this.bind = bind
+    this.metadataUpdates = metadataUpdates
     this.creating = 0
   }
 
@@ -189,6 +197,7 @@ export class NativeReviews {
     const marker = reviewMetadata(reviewID).automation
     const marked = value => Object.entries(marker).every(([key, expected]) => value?.metadata?.automation?.[key] === expected)
     if (!marked(session)) {
+      if (!this.metadataUpdates) throw new Error("Host cannot update reviewer suppression metadata")
       await this.client.session.update({ path: { id: sessionID }, query: { directory: this.directory },
         body: { metadata: reviewMetadata(reviewID, session.metadata) }, throwOnError: true }).then(responseData)
       session = await get()
@@ -198,6 +207,7 @@ export class NativeReviews {
 
   async prepare(plan) {
     if (!["fork", "digest"].includes(plan.mode)) throw new Error("Unknown native review mode")
+    if (plan.mode === "fork" && !this.metadataUpdates) throw new Error("Host cannot mark forked reviewers; digest is required")
     if (typeof plan.instruction !== "string" || !plan.instruction.trim()) throw new Error("Review instruction is required")
     this.creating++
     let session

@@ -1,6 +1,7 @@
 from datetime import datetime
 from html import escape
 import json
+import re
 import shlex
 from urllib.parse import quote
 
@@ -15,7 +16,7 @@ STATE_LABELS = {
     "completed": "Completed", "attempted": "Unfinished", "legacy": "Historical record",
     "interrupted": "Interrupted", "not-reviewed": "Delegate — not reviewed",
 }
-MODE_LABELS = {"fork": "Full conversation", "digest": "Summarized context", "diagnostic": "Cache diagnostic"}
+MODE_LABELS = {"fork": "Full active context", "digest": "Summarized context", "diagnostic": "Cache diagnostic"}
 ACTION_LABELS = {"create": "Create skill", "edit": "Rewrite skill", "patch": "Update skill", "write_file": "Write support file", "remove_file": "Remove support file"}
 PUBLISHED = {"applied", "approved"}
 
@@ -120,7 +121,7 @@ def _recent_reviews(reviews, proposals):
     ) + '</div><p><a href="sessions.html">View all review sessions</a></p>'
 
 
-def render_review(store, review_id):
+def render_review(store, review_id, *, lazy_context=False):
     service_review = next((review for review in store.list_reviews() if review["id"] == review_id), None)
     if service_review is None:
         return None
@@ -149,7 +150,7 @@ def render_review(store, review_id):
       {_skill_change_summary(proposals)}
       {_usage_facts(usage)}
       {_panel("Context decision", _context_decision(service_review), "context-decision")}
-      {_panel("Requests", _request_compare(store.review_context(review_id), calls, service_review), "requests")}
+      {_panel("Requests", _request_compare(store.review_context(review_id), calls, service_review, lazy_context=lazy_context), "requests")}
       {_panel("Error", f"<pre>{escape(error)}</pre>" if error else "<p class='empty'>No error.</p>", "error", open=bool(error))}
       {_panel("Model calls", _toolbar("review-calls") + _call_list(calls), "review-calls", count=len(calls), open=True)}
       {_panel("Evidence", _evidence_blocks(evidence), "evidence", count=len(evidence))}
@@ -510,7 +511,7 @@ def _pill(value):
     return f"<span class=\"pill pill-{kind}\" title=\"{escape(text)}\">{escape(STATE_LABELS.get(text, text.replace('_', ' ').capitalize()))}</span>"
 
 
-def _request_compare(context, calls, review):
+def _request_compare(context, calls, review, *, lazy_context=False):
     context = context or {}
     submitted = {"model": context.get("model"), "reasoning": context.get("reasoning"), "system": context.get("system_prompt"),
                  "messages": context.get("messages") or [], "tools": context.get("tools") or []}
@@ -520,9 +521,13 @@ def _request_compare(context, calls, review):
     label = "Final wire request" if wire_body is not None else "Application arguments (wire request unavailable)"
     note = f"Submitted {len(submitted['messages'])} messages. First recorded request contains {len((sent or {}).get('input') or (sent or {}).get('messages') or [])} input items/messages. Evidence: {first_call.get('evidence_kind') or 'unavailable'}."
     sent_html = _request_view(sent) if sent else '<p class="empty">No model call was stored.</p>'
-    comparison = f'<p class="meta">{escape(note)}</p><div class="compare"><section class="request-frame"><h3>Submitted</h3>{_request_view(submitted)}</section><section class="request-frame"><h3>{label}</h3>{sent_html}</section></div>'
+    comparison = f'<p class="meta">{escape(note)}</p><div class="compare"><section class="request-frame"><h3>Submitted</h3>{_request_view(submitted, lazy_context=lazy_context)}</section><section class="request-frame"><h3>{label}</h3>{sent_html}</section></div>'
     plan = json.loads(review.get("plan_json") or "null")
-    return comparison + '<p class="meta">Host-requested/observed context; final HTTP wire bodies and provider response IDs are unavailable. Skill bodies are an instance snapshot until restart.</p>' + _fold("Parent submission (complete raw host parts)", '<pre>' + escape(_pretty(context)) + '</pre>') + _fold("Native review plan", '<pre>' + escape(_pretty(plan)) + '</pre>')
+    parent = _context_fold("Parent submission (complete raw host parts)", "parent") if lazy_context else _fold("Parent submission (complete raw host parts)", '<pre>' + escape(_pretty(context)) + '</pre>')
+    content = comparison + '<p class="meta">Host-requested/observed context; final HTTP wire bodies and provider response IDs are unavailable. Skill bodies are an instance snapshot until restart.</p>' + parent + _fold("Native review plan", '<pre>' + escape(_pretty(plan)) + '</pre>')
+    if lazy_context:
+        return f'<div data-context-id="{escape(review["id"])}" data-context-url="context-{escape(review["id"])}.js">{content}</div>'
+    return content
 
 
 def _context_decision(review):
@@ -585,7 +590,7 @@ def _model_call_evidence(call):
     """
 
 
-def _request_view(payload):
+def _request_view(payload, *, lazy_context=False):
     parts = ["<dl class=\"facts inline\">"]
     for label, key in (("Model", "model"), ("Reasoning", "reasoning"), ("Temperature", "temperature")):
         parts.append(f"<div><dt>{label}</dt><dd>{escape(_token_text(payload.get(key)) if key == 'temperature' else str(payload.get(key) or ''))}</dd></div>")
@@ -593,15 +598,15 @@ def _request_view(payload):
     system = payload.get("instructions") or payload.get("system")
     if system:
         parts.append(_fold("System / instructions", f"<pre>{escape(system)}</pre>"))
-    for message in payload.get("messages") or []:
-        parts.append(_message_view(message))
+    for index, message in enumerate(payload.get("messages") or []):
+        parts.append(_message_view(message, context_index=index if lazy_context else None))
     for item in payload.get("input") or []:
         parts.append(_fold(str(item.get("type") or item.get("role") or "input"), f"<pre>{escape(_pretty(item))}</pre>"))
     tools = payload.get("tools") or []
     if tools:
         names = ", ".join(_tool_name(tool) for tool in tools)
         parts.append(_fold(f"Tools ({len(tools)}) · {names}", f"<pre>{escape(_pretty(tools))}</pre>"))
-    parts.append(_fold("Complete request fields", f"<pre>{escape(_pretty(payload))}</pre>"))
+    parts.append(_context_fold("Complete request fields", "request") if lazy_context else _fold("Complete request fields", f"<pre>{escape(_pretty(payload))}</pre>"))
     return "\n".join(parts)
 
 
@@ -609,27 +614,48 @@ def _fold(title, content):
     return f"<details class=\"fold\"><summary>{escape(title)}</summary>{content}</details>"
 
 
-def _message_view(message):
+def _context_fold(title, field):
+    return f'<details class="fold" data-context-field="{escape(field)}"><summary>{escape(title)}</summary><div data-context-content aria-live="polite"><p class="meta">Stored context loads when expanded.</p></div></details>'
+
+
+def _message_view(message, *, context_index=None):
     if not isinstance(message, dict):
+        if context_index is not None:
+            return _context_fold(_preview(message), f"message:{context_index}")
         return f"<pre>{escape(str(message))}</pre>"
     role = str(message.get("role") or (message.get("info") or {}).get("role") or "message")
     content = message.get("content", message.get("parts"))
-    body = escape(content) if isinstance(content, str) else escape(_pretty(content))
-    extra = f"<pre>{escape(_pretty(message['tool_calls']))}</pre>" if message.get("tool_calls") else ""
     marker = " · compaction" if message.get("compaction") else ""
     calls = f" · {len(message['tool_calls'])} tools" if message.get("tool_calls") else ""
-    return _fold(f"{role}{marker}{calls} · {_preview(content)}", f"<pre>{body}</pre>{extra}")
+    title = f"{role}{marker}{calls} · {_preview(content)}"
+    if context_index is not None:
+        return _context_fold(title, f"message:{context_index}")
+    body = escape(content) if isinstance(content, str) else escape(_pretty(content))
+    extra = f"<pre>{escape(_pretty(message['tool_calls']))}</pre>" if message.get("tool_calls") else ""
+    return _fold(title, f"<pre>{body}</pre>{extra}")
 
 
 def _preview(content):
-    if not isinstance(content, str):
-        content = "" if content is None else _pretty(content)
-    line = " ".join(content.split())
-    if not line:
-        return "(empty)"
-    if len(line) <= 72:
-        return line
-    return line[:72].rstrip() + "…"
+    if isinstance(content, str):
+        chunks = (content,)
+    elif content is None:
+        chunks = ()
+    else:
+        chunks = json.JSONEncoder(ensure_ascii=False, indent=2).iterencode(content)
+    line, space = "", False
+    for chunk in chunks:
+        for token in re.finditer(r"\s+|\S{1,73}", chunk):
+            start, end = token.span()
+            if chunk[start].isspace():
+                space = bool(line)
+                continue
+            if space:
+                line += " "
+            space = False
+            line += chunk[start:min(end, start + 73 - len(line))]
+            if len(line) > 72:
+                return line[:72].rstrip() + "…"
+    return line or "(empty)"
 
 
 def _tool_name(tool):
@@ -693,7 +719,9 @@ def _amount(total, key):
 
 
 def _pretty(value):
-    return json.dumps(value, ensure_ascii=False, indent=2)
+    # Indented JSON uses Python's recursive encoder; large transcripts need the fast C encoder.
+    compact = json.dumps(value, ensure_ascii=False)
+    return json.dumps(value, ensure_ascii=False, indent=2) if len(compact) <= 65536 else compact
 
 
 def _page(title, body):
@@ -783,7 +811,7 @@ def _page(title, body):
   .session-metrics {{ display: grid; justify-items: end; gap: 0.35rem; text-align: right; }}
   .session-actions {{ display: flex; justify-content: flex-end; margin-top: 1rem; }}
   .session-actions form {{ margin: 0; }}
-  details.model-call > summary, details.fold > summary, details.evidence > summary {{ cursor: pointer; padding: 0.65rem 0.8rem; }}
+  details.model-call > summary, details.fold > summary, details.evidence > summary {{ cursor: pointer; padding: 0.65rem 0.8rem; overflow-wrap: anywhere; }}
   details.session-calls button {{ color: var(--bad); }}
   .review-frame {{ border-left: 3px solid var(--line); margin: 1rem 0; padding: 0.2rem 0 0.2rem 1rem; min-width: 0; }}
   .review-frame header {{ display: grid; gap: 0.3rem; padding: 0.35rem 0 0.75rem; }}
@@ -974,6 +1002,79 @@ def _page(title, body):
   }}
   document.querySelectorAll(".model-call[data-call-url]").forEach((call) => {{
     call.addEventListener("toggle", () => {{ if (call.open) loadCallEvidence(call); }});
+  }});
+  const contextRoot = document.querySelector("[data-context-url]");
+  const contextFolds = [...document.querySelectorAll("[data-context-field]")];
+  let reviewContext;
+  function renderContextEvidence(fold) {{
+    const field = fold.dataset.contextField;
+    let values;
+    if (field === "parent") {{
+      values = [reviewContext];
+    }} else if (field === "request") {{
+      values = [{{model: reviewContext.model ?? null, reasoning: reviewContext.reasoning ?? null,
+        system: reviewContext.system_prompt ?? null, messages: reviewContext.messages || [], tools: reviewContext.tools || []}}];
+    }} else {{
+      const message = reviewContext.messages[Number(field.split(":")[1])];
+      if (message && typeof message === "object" && !Array.isArray(message)) {{
+        values = [Object.hasOwn(message, "content") ? message.content : message.parts];
+        if (message.tool_calls?.length) values.push(message.tool_calls);
+      }} else {{
+        values = [message];
+      }}
+    }}
+    const content = fold.querySelector("[data-context-content]");
+    content.replaceChildren(...values.map(value => {{
+      const pre = document.createElement("pre");
+      pre.textContent = typeof value === "string" ? value : JSON.stringify(value ?? null, null, 2);
+      return pre;
+    }}));
+    content.removeAttribute("aria-busy");
+    fold.dataset.loaded = "true";
+  }}
+  document.addEventListener("skill-learn-context-evidence", event => {{
+    if (!contextRoot || event.detail.id !== contextRoot.dataset.contextId || contextRoot.dataset.loading !== "true") return;
+    reviewContext = event.detail.context || {{}};
+    contextFolds.filter(fold => fold.open).forEach(renderContextEvidence);
+  }});
+  function loadContextEvidence(fold) {{
+    if (fold.dataset.loaded === "true") return;
+    if (reviewContext !== undefined) {{ renderContextEvidence(fold); return; }}
+    const content = fold.querySelector("[data-context-content]");
+    content.setAttribute("aria-busy", "true");
+    const loading = document.createElement("p");
+    loading.className = "meta";
+    loading.textContent = "Loading stored context…";
+    content.replaceChildren(loading);
+    if (contextRoot.dataset.loading === "true") return;
+    contextRoot.dataset.loading = "true";
+    const script = document.createElement("script");
+    script.src = contextRoot.dataset.contextUrl;
+    const complete = () => {{
+      for (const pending of contextFolds) {{
+        const content = pending.querySelector("[data-context-content]");
+        if (!content.hasAttribute("aria-busy")) continue;
+        content.removeAttribute("aria-busy");
+        if (reviewContext === undefined) {{
+          const message = document.createElement("p");
+          message.className = "error-text";
+          message.textContent = "Could not load stored context.";
+          const retry = document.createElement("button");
+          retry.type = "button";
+          retry.textContent = "Retry";
+          retry.addEventListener("click", () => loadContextEvidence(pending));
+          content.replaceChildren(message, retry);
+        }}
+      }}
+      delete contextRoot.dataset.loading;
+      script.remove();
+    }};
+    script.onload = complete;
+    script.onerror = complete;
+    document.head.append(script);
+  }}
+  contextFolds.forEach(fold => {{
+    fold.addEventListener("toggle", () => {{ if (fold.open) loadContextEvidence(fold); }});
   }});
   if (filter) applyFilters();
   function revealAnchor() {{

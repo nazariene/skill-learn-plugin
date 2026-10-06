@@ -218,6 +218,13 @@ class LearningTests(unittest.TestCase):
         base = {"id": "rv", "session_id": "p", "watermark": "w", "messages": raw, "capture": {"profile": profile, "compatibility": {"compatible": True}, "parentInputTokens": 500, "parentOutputTokens": 100}}
         self.assertEqual(build_plan(self.core.settings, base, self.core.library)["mode"], "fork")
         base["capture"]["parentInputTokens"] = 200000
+        plan = build_plan(self.core.settings, base, self.core.library)
+        self.assertEqual(plan["mode"], "fork")
+        base["capture"]["parentInputTokens"] += 250000 - plan["decision"]["forkInputTokens"]
+        plan = build_plan(self.core.settings, base, self.core.library)
+        self.assertEqual(plan["decision"]["forkInputTokens"], 250000)
+        self.assertEqual(plan["mode"], "fork")
+        base["capture"]["parentInputTokens"] += 1
         self.assertEqual(build_plan(self.core.settings, base, self.core.library)["decision"]["reason"], "fork-input-limit")
         base["capture"]["parentInputTokens"] = None
         self.assertEqual(build_plan(self.core.settings, base, self.core.library)["mode"], "digest")

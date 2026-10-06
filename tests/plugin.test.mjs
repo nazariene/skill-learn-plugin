@@ -150,6 +150,20 @@ async function settle(fixture, id = "parent", observe = true) {
   timers.fire(0)
 }
 
+test("the default idle trigger schedules 120 seconds without submitting before its timer fires", async t => {
+  const home = mkdtempSync("/tmp/opencode/skill-idle-default-")
+  writeFileSync(resolve(home, "settings.yaml"), "library:\n  root: skills\nnotifications:\n  enabled: false\n")
+  const timers = timerQueue(), host = fakeHost()
+  const hooks = await createPlugin({ client: host.client, directory: home }, { home }, { ...timers, hostVersion })
+  host.hooks = hooks
+  t.after(async () => { await hooks.dispose(); rmSync(home, { recursive: true, force: true }) })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "parent" } } })
+  assert.equal([...timers.timers].filter(timer => timer.delay === 120000).length, 1)
+  assert.deepEqual(host.requests, [])
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "parent", status: { type: "busy" } } } })
+  assert.equal([...timers.timers].some(timer => timer.delay === 120000), false)
+})
+
 test("wired native fork, inherited event exclusion, host evidence and restart idempotence", async t => {
   const f = await fixture(t)
   await settle(f)
@@ -364,14 +378,12 @@ test("unexpected stdout and unsupported response versions disable and terminate 
   }
 })
 
-test("bad settings or missing Python disables learning without installing parent hooks", async t => {
+test("bad settings or missing Python rejects startup without installing parent hooks", async t => {
   const home = mkdtempSync("/tmp/opencode/skill-disabled-")
   t.after(() => rmSync(home, { recursive: true, force: true }))
   writeFileSync(resolve(home, "settings.yaml"), "llm:\n  apiKey: removed\n")
-  const diagnostics = []
-  assert.deepEqual(await createPlugin({ directory: home, client: fakeHost().client }, { home }, { hostVersion, diagnostic: message => diagnostics.push(message) }), {})
-  assert.deepEqual(await createPlugin({ directory: home, client: fakeHost().client }, { home, python: "/nonexistent/python" }, { hostVersion, diagnostic: message => diagnostics.push(message) }), {})
-  assert.ok(diagnostics.some(message => message.includes("learning disabled")))
+  await assert.rejects(createPlugin({ directory: home, client: fakeHost().client }, { home }, { hostVersion }))
+  await assert.rejects(createPlugin({ directory: home, client: fakeHost().client }, { home, python: "/nonexistent/python" }, { hostVersion }))
 })
 
 function expireLease(home, reviewID) {
@@ -521,7 +533,7 @@ test("Bash replacement keeps settings and databases while removing other old fil
   assert.ok(readFileSync(resolve(plugin, "index.js"), "utf8").includes(JSON.stringify(plugin)))
   const output = execFileSync("python3", ["-c", "from skill_learn.settings import DEFAULT_HOME; from skill_learn.native_store import NativeStore; import sys; print(DEFAULT_HOME); s=NativeStore(DEFAULT_HOME); assert s.evidence(sys.argv[1])[0]['payload']['text']=='original evidence'; assert s._connection.execute(\"SELECT count(*) FROM runtime.operations WHERE id='kept-operation'\").fetchone()[0]==1; s.close()", reviewID], { cwd: resolve(plugin, "runtime"), env }).toString()
   assert.equal(output.trim(), plugin)
-  const defaultHome = execFileSync(process.execPath, ["--input-type=module", "-e", `import { createPlugin } from ${JSON.stringify(resolve(plugin, "plugin.mjs"))}; await createPlugin({directory: '.', client: {}}, {}, {hostVersion: ${JSON.stringify(hostVersion)}, startCore: options => { console.log(options.home); throw Error('stop'); }, diagnostic: () => {}})`], { env }).toString()
+  const defaultHome = execFileSync(process.execPath, ["--input-type=module", "-e", `import assert from 'node:assert/strict'; import { createPlugin } from ${JSON.stringify(resolve(plugin, "plugin.mjs"))}; await assert.rejects(createPlugin({directory: '.', client: {}}, {}, {hostVersion: ${JSON.stringify(hostVersion)}, startCore: options => { console.log(options.home); throw Error('stop'); }, diagnostic: () => {}}), /stop/)`], { env }).toString()
   assert.equal(defaultHome.trim(), plugin)
   const report = JSON.parse(execFileSync("python3", ["-m", "skill_learn", "report"], { cwd: resolve(plugin, "runtime"), env }).toString())
   assert.equal(report.index, resolve(plugin, "reports/index.html"))

@@ -47,6 +47,11 @@ class ReportingTests(unittest.TestCase):
         root = self.core.settings.reports_root
         return root / ".generations" / json.loads((root / ".skill-learn-report.json").read_text())["generation"]
 
+    def stored_context(self, review):
+        source = (self.generation() / f"context-{review}.js").read_text()
+        payload = re.search(r'JSON.parse\((".*")\)', source).group(1)
+        return json.loads(json.loads(payload))["context"]
+
     def cli(self, *arguments, ok=True):
         command = subprocess.run([sys.executable, "-m", "skill_learn", "--home", str(self.home), *arguments], capture_output=True, text=True)
         self.assertEqual(command.returncode, 0 if ok else 1, command.stderr)
@@ -76,12 +81,28 @@ class ReportingTests(unittest.TestCase):
         for target in re.findall(r'href="(review-[^"]+\.html)(?:#[^"]+)?"', index):
             self.assertTrue((directory / target).is_file(), target)
         detail = (directory / f"review-{second}.html").read_text()
-        for label in ("Complete parent evidence", "Complete request fields", "Complete host response fields", "within-review", "raw provider counters/availability unavailable", "ordering", "sessions.html"):
+        self.assertEqual(self.stored_context(second), self.core.store.review_context(second))
+        for label in ('data-context-field="parent"', "Complete request fields", "Complete host response fields", "within-review", "raw provider counters/availability unavailable", "ordering", "sessions.html"):
             if label == "within-review":
                 continue
             self.assertIn(label, detail)
         self.assertIn("initial parent-to-review observation", detail)
         self.assertIn("10,000", detail)
+
+    def test_large_parent_context_is_complete_without_repeating_it_in_html(self):
+        tail = "FINAL_RAW_PART_Ж_日本語_</script>"
+        messages = [{"info": {"role": "user"}, "parts": [{"type": "tool", "state": {
+            "output": [{"nested": {"__proto__": {"text": "retained"}}, "text": "large evidence " * 100} for _ in range(1000)] + [tail]
+        }}]}]
+        review = self.request("enqueue", harness="opencode", hostID="host", sessionID="large", watermark="large", messages=messages)["reviewId"]
+        generate(self.core.store, self.core.settings)
+        self.assertEqual(self.stored_context(review)["messages"], messages)
+        detail = (self.generation() / f"review-{review}.html").read_text()
+        self.assertNotIn(tail, detail)
+        self.assertLess(len(detail), 100000)
+        self.assertIn('data-context-field="message:0"', detail)
+        self.assertIn('data-context-field="request"', detail)
+        self.assertIn('data-context-field="parent"', detail)
 
     def test_overview_and_sessions_use_counters_only_and_partial_usage_is_retained(self):
         review = self.review()
@@ -151,6 +172,7 @@ class ReportingTests(unittest.TestCase):
         root, old = self.core.settings.reports_root, self.generation()
         index = (root / "index.html").read_bytes()
         detail = (old / f"review-{review}.html").read_bytes()
+        context = (old / f"context-{review}.js").read_bytes()
         foreign = old / "operator-note.txt"
         foreign.write_text("keep")
         with patch("skill_learn.report_view.render_review", side_effect=OSError("disk full")):
@@ -158,10 +180,12 @@ class ReportingTests(unittest.TestCase):
                 generate(self.core.store, self.core.settings)
         self.assertEqual((root / "index.html").read_bytes(), index)
         self.assertEqual((old / f"review-{review}.html").read_bytes(), detail)
+        self.assertEqual((old / f"context-{review}.js").read_bytes(), context)
         self.assertEqual(len(list((root / ".generations").iterdir())), 1)
         generate(self.core.store, self.core.settings)
         self.assertEqual(foreign.read_text(), "keep")
         self.assertFalse((old / f"review-{review}.html").exists())
+        self.assertFalse((old / f"context-{review}.js").exists())
         before_swap = (root / "index.html").read_bytes()
         real_replace = os.replace
         def fail_entrypoint(source, target):
@@ -384,6 +408,76 @@ class ReportingTests(unittest.TestCase):
         sessions.write_text(sessions.read_text().replace("</body>", assertions + "</body>"))
         for width in (1280, 390):
             result = self.chrome(sessions, "light", width, wait_for="document.body.dataset.browserResult")
+            self.assertEqual(re.search(r'data-browser-result="([^"]+)"', result).group(1), "passed")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for file-URL acceptance")
+    def test_file_url_parent_context_loads_once_retries_and_preserves_raw_parts(self):
+        hostile = '</script><img src=x onerror="window.attacked=true">'
+        messages = [
+            {"role": "user", "content": "TEXT_PREFIX " + "x" * 70000 + hostile + " END_PARENT_EVIDENCE", "tool_calls": [{"id": "tool-one"}]},
+            {"info": {"role": "assistant"}, "parts": [{"type": "tool", "state": {"output": {"__proto__": {"text": "retained"}, "unicode": "Ж_日本語"}}}]},
+        ]
+        review = self.request("enqueue", harness="opencode", hostID="host", sessionID="parent", watermark="parent", messages=messages)["reviewId"]
+        generate(self.core.store, self.core.settings)
+        detail = self.generation() / f"review-{review}.html"
+        assertions = r"""<script>addEventListener('load', async () => {
+          try {
+            const check = (ok, message) => { if (!ok) throw Error(message); };
+            const until = async predicate => {
+              for (let i = 0; i < 200; i++) {
+                if (predicate()) return;
+                await new Promise(resolve => setTimeout(resolve, 10));
+              }
+              throw Error('context did not finish loading');
+            };
+            let deliveries = 0;
+            document.addEventListener('skill-learn-context-evidence', () => deliveries++);
+            const root = document.querySelector('[data-context-url]');
+            const message = root.querySelector('[data-context-field="message:0"]');
+            const other = root.querySelector('[data-context-field="message:1"]');
+            const request = root.querySelector('[data-context-field="request"]');
+            const parent = root.querySelector('[data-context-field="parent"]');
+            const content = message.querySelector('[data-context-content]');
+            check(deliveries === 0 && !root.textContent.includes('END_PARENT_EVIDENCE'), 'context starts deferred');
+            document.querySelector('#requests > details').open = true;
+            await new Promise(resolve => setTimeout(resolve, 20));
+            check(deliveries === 0, 'opening Requests keeps transcript deferred');
+            const source = root.dataset.contextUrl;
+            root.dataset.contextUrl = 'missing-context.js';
+            message.open = true;
+            await until(() => content.querySelector('button'));
+            check(content.textContent.includes('Could not load'), 'load failure is visible');
+            root.dataset.contextUrl = source;
+            content.querySelector('button').click();
+            other.open = true;
+            request.open = true;
+            await until(() => [message, other, request].every(fold => fold.dataset.loaded === 'true'));
+            check(deliveries === 1, 'concurrent expansions share one transcript load');
+            check(content.querySelector('pre').textContent.endsWith('END_PARENT_EVIDENCE'), 'complete long message');
+            check(JSON.parse(content.querySelectorAll('pre')[1].textContent)[0].id === 'tool-one', 'message tool calls retained');
+            const parts = JSON.parse(other.querySelector('pre').textContent);
+            check(Object.hasOwn(parts[0].state.output, '__proto__') && parts[0].state.output.__proto__.text === 'retained', 'special JSON keys retained');
+            check(parts[0].state.output.unicode === 'Ж_日本語', 'Unicode retained');
+            const submitted = JSON.parse(request.querySelector('pre').textContent);
+            check(submitted.messages.length === 2 && submitted.messages[0].content.endsWith('END_PARENT_EVIDENCE'), 'complete request fields');
+            check(parent.dataset.loaded !== 'true', 'unused raw parent stays unrendered');
+            parent.open = true;
+            await until(() => parent.dataset.loaded === 'true');
+            const original = JSON.parse(parent.querySelector('pre').textContent);
+            check(original.session_id === 'parent' && original.messages[0].content === submitted.messages[0].content, 'complete raw host context');
+            message.open = false;
+            await new Promise(resolve => setTimeout(resolve, 20));
+            message.open = true;
+            await new Promise(resolve => setTimeout(resolve, 20));
+            check(deliveries === 1, 'reopening uses retained context');
+            check(!window.attacked && !root.querySelector('img'), 'context is rendered as text');
+            check(document.documentElement.scrollWidth <= innerWidth + 1, 'long context does not overflow');
+            document.body.dataset.browserResult = 'passed';
+          } catch (error) { document.body.dataset.browserResult = error.message; }
+        });</script>"""
+        detail.write_text(detail.read_text().replace("</body>", assertions + "</body>"))
+        for width in (1280, 390):
+            result = self.chrome(detail, "light", width, wait_for="document.body.dataset.browserResult")
             self.assertEqual(re.search(r'data-browser-result="([^"]+)"', result).group(1), "passed")
 
     def chrome(self, path, theme, width, wait_for=None):

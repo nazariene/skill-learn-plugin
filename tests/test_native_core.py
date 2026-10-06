@@ -39,9 +39,9 @@ class NativeCoreTests(unittest.TestCase):
     def test_defaults_paths_and_budgets(self):
         (self.home / "settings.yaml").unlink()
         settings = load_settings(self.home)
-        self.assertEqual(settings.triggers["idle"]["seconds"], 15)
+        self.assertEqual(settings.triggers["idle"]["seconds"], 120)
         self.assertEqual(settings.triggers["turns"]["count"], 25)
-        self.assertEqual(settings.max_fork_input_tokens, 120000)
+        self.assertEqual(settings.max_fork_input_tokens, 250000)
         self.assertEqual(settings.steps, 16)
         self.assertEqual(settings.library_root, self.home / "opencode/skills")
         self.assertEqual(settings.reports_root, self.home / "reports")
@@ -52,6 +52,17 @@ class NativeCoreTests(unittest.TestCase):
         self.assertIsNone(self.settings("review:\n  maxForkInputTokens: null\n").max_fork_input_tokens)
         with patch.dict(os.environ, {"SKILL_LEARNING_NOTIFICATIONS": "0"}):
             self.assertFalse(load_settings(self.home).notifications_enabled)
+
+    def test_shipped_defaults_and_explicit_trigger_and_fork_overrides(self):
+        example = Path(__file__).resolve().parents[1] / "docs/settings.example.yaml"
+        settings = self.settings(example.read_text())
+        self.assertEqual(settings.triggers["idle"]["seconds"], 120)
+        self.assertEqual(settings.max_fork_input_tokens, 250000)
+        self.assertIsNone(settings.max_input_tokens)
+        explicit = self.settings("triggers:\n  idle:\n    seconds: 15\nreview:\n  maxForkInputTokens: 120000\n  maxInputTokens: 42\n")
+        self.assertEqual(explicit.triggers["idle"]["seconds"], 15)
+        self.assertEqual(explicit.max_fork_input_tokens, 120000)
+        self.assertEqual(explicit.input_budget(400000), 42)
 
     def test_invalid_removed_and_duplicate_settings(self):
         for text in ("server: {}", "llm:\n  apiKey: secret", "llm:\n  authFile: auth.json", "llm:\n  selection: service", "llm:\n  selection: []", "approval:\n  generated: []", "reports:\n  enabled: true", "reports:\n  enabled: false", "review:\n  maxForkInputTokens: 0", "runtime:\n  leaseSeconds: true", "notifications:\n  volume: .nan", "reports:\n  root: reports\n  root: other-reports", "triggers:\n  idle:\n    seconds: -1", "library:\n  root: 12", "library:\n  root: ''", "library:\n  root: false", "library:\n  root: []"):

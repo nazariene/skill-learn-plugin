@@ -31,10 +31,9 @@ class ReportSnapshot:
                 self.evidence_by_review = {review["id"]: store.evidence(review["id"]) for review in self.reviews}
                 self.delegates = []
                 self.delegate_evidence = {}
-                for submission in store.list_submissions():
-                    if submission["delegate_depth"] and not submission["review_id"]:
-                        self.delegates.append({"id": submission["id"], "harness": submission["harness"], "session_id": submission["session_id"], "session_name": submission["session_name"], "received_at": submission["received_at"], "status": "not-reviewed", "context_mode": None})
-                        self.delegate_evidence[submission["id"]] = submission
+                for submission in store.list_submissions(delegates_only=True):
+                    self.delegates.append({"id": submission["id"], "harness": submission["harness"], "session_id": submission["session_id"], "session_name": submission["session_name"], "received_at": submission["received_at"], "status": "not-reviewed", "context_mode": None})
+                    self.delegate_evidence[submission["id"]] = submission
             finally:
                 store._connection.rollback()
 
@@ -105,14 +104,18 @@ def _publish(root, snapshot, settings):
             identity = review["id"]
             if not re.fullmatch(r"rv_[a-zA-Z0-9]+", identity):
                 raise ValueError("Unsafe review page identity")
-            page = report_view.render_review(snapshot, identity)
+            name = f"context-{identity}.js"
+            payload = json.dumps({"id": identity, "context": snapshot.review_context(identity)}, ensure_ascii=False, separators=(",", ":"))
+            (directory / name).write_text('document.dispatchEvent(new CustomEvent("skill-learn-context-evidence", {detail: JSON.parse(' + json.dumps(payload, ensure_ascii=False) + ')}));\n', encoding="utf-8")
+            files.append(name)
+            page = report_view.render_review(snapshot, identity, lazy_context=True)
             (directory / f"review-{identity}.html").write_text(page, encoding="utf-8")
             files.append(f"review-{identity}.html")
         for delegate in snapshot.delegates:
             identity = delegate["id"]
             if not re.fullmatch(r"sub_[a-zA-Z0-9]+", identity):
                 raise ValueError("Unsafe delegate page identity")
-            body = report_view._navigation("sessions") + '<a href="sessions.html">Review sessions</a><h1>' + escape(delegate.get("session_name") or "Delegate session") + '</h1><p class="identifier">[' + escape(delegate["session_id"]) + ']</p><p>Delegate — not reviewed.</p>' + report_view._fold("Stored host submission", '<pre>' + escape(json.dumps(snapshot.delegate_evidence[identity], ensure_ascii=False, indent=2)) + '</pre>')
+            body = report_view._navigation("sessions") + '<a href="sessions.html">Review sessions</a><h1>' + escape(delegate.get("session_name") or "Delegate session") + '</h1><p class="identifier">[' + escape(delegate["session_id"]) + ']</p><p>Delegate — not reviewed.</p>' + report_view._fold("Stored host submission", '<pre>' + escape(report_view._pretty(snapshot.delegate_evidence[identity])) + '</pre>')
             (directory / f"review-{identity}.html").write_text(report_view._page("Delegate session", body), encoding="utf-8")
             files.append(f"review-{identity}.html")
         for section in ("sessions", "skills"):
@@ -144,7 +147,7 @@ def _publish(root, snapshot, settings):
                     owned = json.loads(ownership.read_text())
                     if owned.get("format") == FORMAT:
                         for name in owned.get("files", []):
-                            if name in {"index.html", "sessions.html", "skills.html"} or re.fullmatch(r"review-(?:rv|sub)_[a-zA-Z0-9]+\.html|call-[0-9]+\.js", name):
+                            if name in {"index.html", "sessions.html", "skills.html"} or re.fullmatch(r"review-(?:rv|sub)_[a-zA-Z0-9]+\.html|call-[0-9]+\.js|context-rv_[a-zA-Z0-9]+\.js", name):
                                 (old / name).unlink(missing_ok=True)
                         ownership.unlink()
                         try:

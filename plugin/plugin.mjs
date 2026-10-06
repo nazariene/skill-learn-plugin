@@ -3,7 +3,7 @@ import { homedir } from "node:os"
 import { resolve } from "node:path"
 import { realpathSync } from "node:fs"
 import { ChildCore } from "./child.mjs"
-import { NativeReviews, ParentProfiles, supportedHostVersion, responseData, readMessages, transcriptWatermark, portableOptions, portableHeaders } from "./native.mjs"
+import { NativeReviews, ParentProfiles, supportedHostVersion, responseData, readMessages, transcriptWatermark, profileAnchor, portableOptions, portableHeaders } from "./native.mjs"
 
 const AUXILIARY = new Set(["title", "summary", "compaction", "user-memory-collector", "project-memory-collector", "skill-learner", "skill-learning-review", "skill-evaluator", "skill-grader"])
 const hash = value => createHash("sha256").update(JSON.stringify(value)).digest("hex")
@@ -32,7 +32,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
   const background = promise => { promise.catch(error => diagnostic(error.message)) }
   const profiles = new ParentProfiles({ reviewers, diagnostic, hostVersion: input.hostVersion || dependencies.hostVersion || null })
   const native = new NativeReviews({ client: input.client, directory: input.directory, reviewers,
-    bind: payload => child.request("bind", { ...payload, owner }) })
+    bind: payload => child.request("bind", { ...payload, owner }), metadataUpdates: dependencies.metadataUpdates !== false })
   const profileHooks = profiles.hooks()
 
   async function abortOwned() {
@@ -63,9 +63,8 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
     }
     await preload()
   } catch (error) {
-    diagnostic(`learning disabled: ${error.message}`)
     await child?.dispose?.()
-    return {}
+    throw error
   }
 
   function stateFor(id) {
@@ -97,7 +96,8 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
         state: "preparing", terminal: row.status !== "running", inherited: new Set(JSON.parse(row.inherited_json || "[]")),
         attempts: new Map(), pendingCalls: [], seenSteps: new Set(), seenParts: new Map() })
       try {
-        await native.mark(row.reviewer_id, row.id)
+        // Older hosts cannot repair completed reviewers; their durable IDs still exclude them.
+        if (!reviewers.get(row.reviewer_id).terminal || native.metadataUpdates) await native.mark(row.reviewer_id, row.id)
         reviewers.get(row.reviewer_id).state = "ready"
       } catch (error) {
         if (!error.message.includes("404") && !error.message.includes("NotFound") && !error.message.includes("not found")) throw error
@@ -109,13 +109,18 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
   async function submission(id, trigger) {
     const { session, messages } = await native.read(id)
     if (!session?.id || !messages.length || AUXILIARY.has(session.agent)) return null
-    const latestUser = messages.findLast(message => message.info?.role === "user")?.info
+    const latestUser = messages.findLast(message => message.info?.role === "user" && !message.info.synthetic)?.info
     const observed = profiles.parents.get(id)
-    const profile = observed || { model: latestUser?.model ? { providerID: latestUser.model.providerID, modelID: latestUser.model.modelID } : undefined,
-      variant: latestUser?.model?.variant ?? latestUser?.variant ?? null, agent: latestUser?.agent || session.agent || "build", limitations: ["Parent public-hook observations unavailable"] }
+    const anchor = profileAnchor(messages)
+    const fresh = observed && anchor && observed.turnID === anchor.id
+    const profile = fresh ? observed : { model: latestUser?.model?.providerID ? { providerID: latestUser.model.providerID, modelID: latestUser.model.modelID } :
+      session.model?.providerID ? { providerID: session.model.providerID, modelID: session.model.id } : undefined,
+      variant: latestUser?.model?.variant ?? latestUser?.variant ?? session.model?.variant ?? null,
+      agent: latestUser?.agent || session.agent || "build", limitations: ["Parent public-hook observations unavailable for the active context"] }
     const selected = settings.selection === "follow" && profile.model?.providerID ? { ...profile.model, variant: profile.variant } : {
       providerID: settings.model.split("/")[0], modelID: settings.model.split("/").slice(1).join("/"), variant: settings.variant }
-    const compatibility = profiles.compatibility(session, messages, selected)
+    let compatibility = profiles.compatibility(session, messages, selected)
+    if (compatibility.compatible && !native.metadataUpdates) compatibility = { compatible: false, reason: "reviewer-metadata-update-unavailable" }
     const last = messages.findLast(message => message.info?.role === "assistant" && message.info.finish && !message.info.summary)
     const counters = last?.info?.tokens
     const values = [counters?.input, counters?.cache?.read, counters?.cache?.write]

@@ -4,7 +4,7 @@ runtime:
 triggers:
   idle:
     enabled: true
-    seconds: 15
+    seconds: 120
   turns:
     enabled: true
     count: 25
@@ -16,7 +16,7 @@ llm:
   contextWindow: null
 review:
   contextMode: auto
-  maxForkInputTokens: 120000
+  maxForkInputTokens: 250000
   maxInputTokens: null
 library:
   root: null # Optional; defaults to OpenCode's global skills folder.

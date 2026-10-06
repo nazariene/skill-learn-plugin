@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import { resolve } from "node:path"
 import { createPlugin } from "./plugin.mjs"
-import { portableOptions, responseData, V2_HOST_VERSIONS } from "./native.mjs"
+import { portableOptions, profileAnchor, responseData, V2_HOST_VERSIONS } from "./native.mjs"
 
 const fingerprint = value => createHash("sha256").update(JSON.stringify(value)).digest("hex")
 const generationKeys = ["temperature", "topP", "topK", "maxTokens"]
@@ -86,16 +86,9 @@ export async function setupV2(ctx, options = {}, dependencies = {}) {
     }
     const messages = async id => {
       const session = await readSession(id)
-      const pages = [], seen = new Set()
-      let cursor
-      do {
-        const page = await host.message.list({ sessionID: id, ...(cursor ? { cursor } : { order: "asc", limit: 200 }) })
-        pages.push(...page.data)
-        cursor = page.cursor.next || undefined
-        if (cursor && seen.has(cursor)) throw new Error("OpenCode repeated a message pagination cursor")
-        if (cursor) seen.add(cursor)
-      } while (cursor)
-      return pages.map(message => projectV2Message(message, session))
+      // The host owns the completed-compaction boundary, including retained/provider context.
+      const context = await ctx.session.context({ sessionID: id })
+      return context.map(message => projectV2Message(message, session))
     }
     // The queue engine's internal host seam retains its existing call shapes.
     // All operations below use the released V2 public APIs.
@@ -105,7 +98,8 @@ export async function setupV2(ctx, options = {}, dependencies = {}) {
       status: () => host.session.active(),
       fork: request => host.session.fork({ sessionID: request.path.id }),
       create: request => ctx.session.create({ location: { directory }, title: request.body.title, metadata: request.body.metadata }),
-      update: request => ctx.session.update({ sessionID: request.path.id, title: request.body.title,
+      // The 2.0.21 context helper ignores metadata; use the authenticated HTTP operation.
+      update: request => host.session.update({ sessionID: request.path.id, title: request.body.title,
         ...(request.body.metadata ? { metadata: request.body.metadata } : {}),
         ...(request.body.permission ? { permissions: request.body.permission } : {}) }),
       prompt: async request => {
@@ -123,8 +117,7 @@ export async function setupV2(ctx, options = {}, dependencies = {}) {
       },
     } }
     hooks = await createPlugin({ client, directory, serverUrl: connection.url, hostVersion: ctx.app.version },
-      { ...ctx.options, ...options }, { ...dependencies, hostVersion: ctx.app.version, diagnostic })
-    if (!hooks.dispose) return
+      { ...ctx.options, ...options }, { ...dependencies, hostVersion: ctx.app.version, diagnostic, metadataUpdates: ctx.app.version !== "2.0.6" })
     const skills = await hooks["native.skills"]()
     registrations.push(await ctx.skill.transform(editor => {
       for (const skill of skills) if (!editor.get(skill.id)) editor.add(skill)
@@ -135,7 +128,7 @@ export async function setupV2(ctx, options = {}, dependencies = {}) {
         const session = await readSession(event.sessionID)
         const observed = await registry({ ...session, agent: event.agent, model: event.model })
         const history = await messages(event.sessionID)
-        const latest = history.findLast(message => message.info.role === "user" && !message.info.synthetic)?.info
+        const latest = profileAnchor(history)
         const input = { sessionID: event.sessionID, agent: event.agent, model: { ...observed.model,
           variants: { default: {}, ...Object.fromEntries(observed.model.variants.map(variant => [variant.id, variant.settings || {}])) } },
           message: latest, registryFingerprint: observed.fingerprint, toolFingerprint: fingerprint(event.tools),
@@ -215,5 +208,6 @@ export async function setupV2(ctx, options = {}, dependencies = {}) {
     controller?.abort()
     await hooks?.dispose?.()
     await Promise.all(registrations.map(registration => registration.dispose()))
+    throw error
   }
 }

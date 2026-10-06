@@ -604,12 +604,14 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_submissions(self):
+    def list_submissions(self, *, delegates_only=False):
+        condition = "WHERE s.delegate_depth > 0 AND r.id IS NULL" if delegates_only else ""
         with self._lock:
             rows = self._connection.execute(
-                """SELECT s.*, r.id AS review_id, r.status AS review_status, r.outcome, r.context_mode, r.called_model
-                   FROM submissions s LEFT JOIN reviews r ON r.submission_id = s.id
-                   ORDER BY s.received_at"""
+                f"""SELECT s.*, r.id AS review_id, r.status AS review_status, r.outcome, r.context_mode, r.called_model
+                    FROM submissions s LEFT JOIN reviews r ON r.submission_id = s.id
+                    {condition}
+                    ORDER BY s.received_at"""
             ).fetchall()
         return [dict(row) for row in rows]
 

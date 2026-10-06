@@ -12,7 +12,7 @@ for (const version of V2_HOST_VERSIONS) test(`released V2 ${version} prepares na
   const source = label => { const match = chunks.find(text => text.includes(label)); assert.ok(match, label); return match }
   const load = text => import("data:text/javascript;base64," + Buffer.from(text).toString("base64"))
   const { Effect } = await import("effect")
-  const aiPackage = version === "2.0.6" ? "opencode-ai-v2-0-6" : "@opencode/ai"
+  const aiPackage = version === "2.0.6" ? "opencode-ai-v2-0-6" : version === "2.0.24" ? "opencode-ai-v2-0-24" : "@opencode/ai"
   const { LLM, Message } = await import(aiPackage)
   const OpenAI = await import(aiPackage + "/providers/openai")
   const Responses = await import(aiPackage + "/protocols/openai-responses")
@@ -74,18 +74,44 @@ for (const version of V2_HOST_VERSIONS) test(`released V2 ${version} prepares na
   assert.match(source("// src/session/projector.ts"), /agent: parent.agent,[\s\S]*model: parent.model,[\s\S]*permission: parent.permission/)
 })
 
+for (const version of V2_HOST_VERSIONS) test(`released V2 ${version} context update has the actual metadata persistence semantics`, { skip: !existsSync(resolve(root, version)) }, async () => {
+  const path = resolve(root, version, "package/dist/chunks")
+  const source = readdirSync(path).filter(name => name.endsWith(".js")).map(name => readFileSync(resolve(path, name), "utf8"))
+    .find(text => text.includes("update: Effect.fn(function* (input) {"))
+  assert.ok(source, "Released plugin context update")
+  const updateSource = source.slice(source.indexOf("update: Effect.fn(function* (input) {")).split("\n      }),", 1)[0].replace("update: ", "") + "\n})"
+  const { Effect } = await import("effect")
+  const session = { id: "review", metadata: { operator: "retained" }, permissions: [] }
+  const metadata = { ...session.metadata, automation: { suppressAudio: true, suppressMemoryCollection: true } }
+  const operations = []
+  const update = new Function("Effect", "sessions", "return " + updateSource)(Effect, {
+    get: () => Effect.succeed(session),
+    rename: input => Effect.sync(() => { operations.push("title"); session.title = input.title }),
+    setMetadata: input => Effect.sync(() => { operations.push("metadata"); session.metadata = input.metadata }),
+    setPermissions: input => Effect.sync(() => { operations.push("permissions"); session.permissions = input.permissions }),
+  })
+  await Effect.runPromise(update({ sessionID: session.id, title: "Renamed", metadata, permissions: [{ action: "edit", effect: "deny", resource: "*" }] }))
+  assert.deepEqual(operations, version === "2.0.24" ? ["title", "metadata", "permissions"] : ["title", "permissions"])
+  assert.equal(session.metadata.automation?.suppressAudio === true, version === "2.0.24")
+  assert.equal(session.metadata.operator, "retained")
+})
+
 test("released V2 client lowers authenticated public session requests through a fake transport", async () => {
   const { OpenCode } = await import("@opencode/client")
   const requests = []
   const client = OpenCode.make({ baseUrl: "http://offline-host", headers: { Authorization: "fixture-auth" }, fetch: async (request, init) => {
     const input = request instanceof Request ? request : new Request(request, init)
     requests.push({ path: new URL(input.url).pathname, method: input.method, auth: input.headers.get("authorization"), body: await input.text() })
+    if (input.method === "PATCH") return new Response(null, { status: 204 })
     return Response.json(requests.length === 1 ? { data: { id: "review", location: { directory: "/project" } } } : { data: { id: "inbox", type: "user" } })
   } })
   const fork = await client.session.fork({ sessionID: "parent" })
   assert.equal(fork.id, "review")
   await client.session.prompt({ sessionID: "review", text: "Review", delivery: "queue" })
-  assert.deepEqual(requests.map(request => [request.method, request.path]), [["POST", "/api/session/parent/fork"], ["POST", "/api/session/review/prompt"]])
+  const metadata = { operator: "retained", automation: { owner: "skill-learn", kind: "skill-review", reviewID: "rv_fixture", suppressAudio: true, suppressMemoryCollection: true } }
+  await client.session.update({ sessionID: "review", metadata })
+  assert.deepEqual(requests.map(request => [request.method, request.path]), [["POST", "/api/session/parent/fork"], ["POST", "/api/session/review/prompt"], ["PATCH", "/api/session/review"]])
   assert.ok(requests.every(request => request.auth === "fixture-auth"))
   assert.deepEqual(JSON.parse(requests[1].body), { text: "Review", delivery: "queue" })
+  assert.deepEqual(JSON.parse(requests[2].body), { metadata })
 })

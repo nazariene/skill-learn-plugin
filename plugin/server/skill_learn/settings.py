@@ -129,7 +129,7 @@ def load_settings(home=DEFAULT_HOME):
     if variant is not None:
         variant = text(variant, "llm.variant")
     triggers = {}
-    for name, default, minimum in (("idle", 15, 0), ("turns", 25, 1)):
+    for name, default, minimum in (("idle", 120, 0), ("turns", 25, 1)):
         count_key = "seconds" if name == "idle" else "count"
         values = group(groups["triggers"], name, {"enabled", count_key})
         triggers[name] = {"enabled": boolean(values.get("enabled", True), f"triggers.{name}.enabled"),
@@ -157,7 +157,7 @@ def load_settings(home=DEFAULT_HOME):
         selection, model, variant, integer(llm.get("steps", 16), "llm.steps", 1),
         integer(llm.get("contextWindow"), "llm.contextWindow", 1, True), mode,
         integer(review.get("maxInputTokens"), "review.maxInputTokens", nullable=True),
-        integer(review.get("maxForkInputTokens", 120000), "review.maxForkInputTokens", 1, True),
+        integer(review.get("maxForkInputTokens", 250000), "review.maxForkInputTokens", 1, True),
         library_root, user, generated,
         enabled, float(volume), types,
         path_from(home, reports.get("root", "reports"), "reports.root"),
