@@ -22,9 +22,9 @@ The installed package contains the adapter and a `runtime/` directory for Python
 
 ## How to install
 
-Requires **Python 3.11+ with PyYAML 6**, **npm**, and an **OpenCode V2 managed service**, version **2.0.6**, **2.0.21** or **2.0.24**. Check the service with `opencode api get /api/info`, not the CLI version. Other versions and unregistered standalone/embedded hosts disable learning.
+Requires **Python 3.11+ with PyYAML 6**, **npm**, and an **OpenCode V2 managed service**. There is no release-version gate: OpenCode updates do not require allowlist edits. The adapter still verifies the owning service's identity and reviewer safety contracts. Unregistered standalone/embedded hosts are unsupported. Check the service with `opencode api get /api/info`, not the CLI version.
 
-**2.0.6 uses digest reviews** because it cannot update a fork's suppression metadata. **2.0.21/2.0.24 support native forks** through their authenticated metadata-update API.
+Released-source verification covers **2.0.6/2.0.21/2.0.24/2.0.25**; these are test fixtures, not an activation restriction. **2.0.6 uses digest reviews** because it cannot update a fork's suppression metadata. Newer hosts use the authenticated metadata-update API and verify persistence before dispatch.
 
 Startup errors dispose the worker and fail plugin activation, so OpenCode reports **failed**, not **active**. Ordinary parent sessions remain usable.
 
@@ -97,12 +97,16 @@ Edit `<home>/settings.yaml` using the [template](docs/settings.example.yaml), th
 2. **Queue the active context.** A completed compaction starts a new review boundary: capture its checkpoint and subsequent messages through OpenCode's context API. Unchanged context is skipped; renames update display information. Subagents are recorded but not reviewed. Internal reviewers cannot trigger recursive learning.
 3. **Review one at a time per home.** A native **fork** inherits the parent's active context and compatible settings. Profile freshness follows the latest real user turn, or the checkpoint when continuing immediately after compaction. A **digest** summarizes that active context in a fresh session when forced, when the parent model/profile cannot be preserved, or when the initial fork size guard fails.
 4. **Extract changes.** Reviewers may load skills, but cannot execute other tools. Historical tool calls are evidence. Python validates the final feedback and publishes or stages proposals according to `approval.generated`.
-5. **Protect skills.** New skills carry `metadata.origin: generated`. Reviews refuse edits to user-owned, pinned or protected skills and refuse whole-skill deletion. `adopt` explicitly transfers a skill to agent management. Support files stay under `references/`, `templates/` or `scripts/`; patches must match uniquely. Approval checks current file hashes before staged publication.
+5. **Protect skills.** New skills carry `metadata.origin: generated`. Reviews refuse edits to user-owned, pinned or protected skills and refuse whole-skill deletion. `adopt` explicitly transfers a skill to agent management. Each reviewer skill load returns a recorded current snapshot of `SKILL.md` and UTF-8 support files. Existing-skill changes require that snapshot and refuse files changed since it was delivered. Support files stay under `references/`, `templates/` or `scripts/`; patches must match uniquely. Approval rechecks the same baseline before staged publication.
 6. **Recover without replay.** New submissions supersede older work for the same parent, cancelling only its reviewer. Recovery reconnects to retained sessions and collects completed results once. Missing/ambiguous execution or interrupted publication is reconciled, not automatically replayed. Reviewer retries and auxiliary model calls are blocked.
 
 Reports are generated only by the `report` command; reviews and management changes do not create or refresh them. Lifecycle sounds use bundled JennyNeural recordings, played locally without overlap or runtime TTS. A WAV player such as `paplay`, `pw-play` or `ffplay` is required. Sound failures do not change review outcomes.
 
-The skill catalogue and loaded bodies remain a snapshot until restart; Python validates writes against current files. Missing runtime dependencies disable learning without stopping ordinary chat.
+The host skill catalogue remains an instance snapshot; reviewer loads replace stale host bodies with current recorded publication snapshots. Ordinary skill loads are unchanged. Polling transfers only new durable reviewer identities and active-work metadata; full plans are fetched for execution/recovery. Missing runtime dependencies disable learning without stopping ordinary chat.
+
+Completion responses and reports show applied/staged/refused counts. Partial publication retains successful changes and displays the refusal warnings.
+
+**Project skills:** reviews also support the reviewed project's existing `.opencode/skills/` library. Existing names resolve to the project before the global library; feedback can specify `scope: "global"` or `scope: "project"` explicitly. New skills default to global. Project creation requires an existing project library and explicit project scope. Other projects and escaping symlinks are never writable. Ownership, pinning and protection are project-scoped; pending proposals retain their destination and recheck ownership, paths and hashes at approval. Refused publication records its reason rather than an empty failure.
 
 ## Other information
 
@@ -112,9 +116,11 @@ Generate a report directly from the checkout:
 
 ```bash
 ./report.sh
+./report.sh --days 30
+./report.sh --all
 ```
 
-The script works from any working directory, uses the repository's Python code and the installed plugin's settings/databases, and prints the generated index path. `reports.root` selects the output directory. Options: `--home DIRECTORY`, `--python EXECUTABLE`; `SKILL_LEARN_HOME` and OpenCode config-directory overrides also apply. Python 3.11+ and PyYAML 6 are required; OpenCode need not be running.
+The script works from any working directory, uses the repository's Python code and the installed plugin's settings/databases, and prints the generated index path. By default it includes submissions from the past 7 days (rolling UTC window), with their reviews, calls, proposals and evidence; library metadata still shows the current state. Use `--days N` for another window or `--all` for all history. `reports.root` selects the output directory. Other options: `--home DIRECTORY`, `--python EXECUTABLE`; `SKILL_LEARN_HOME` and OpenCode config-directory overrides also apply. Python 3.11+ and PyYAML 6 are required; OpenCode need not be running.
 
 Run commands from the installed runtime using the selected Python interpreter:
 
@@ -127,20 +133,25 @@ Adjust the path for custom installations. Put `--home PATH` before the command t
 
 | Command | Purpose |
 |---|---|
+| `status` | Read-only worker health, queue, recent results/failures, last success, effective settings and digest-fallback reasons |
 | `pending` | List pending skill proposals |
 | `show ID` | Inspect a review, proposal or diagnostic probe |
 | `approve PROPOSAL_ID` / `reject PROPOSAL_ID` | Apply or reject a pending proposal |
 | `adopt SKILL_NAME` | Mark an existing skill as agent-managed |
 | `pin SKILL_NAME` / `unpin SKILL_NAME` | Protect or release a skill from background edits |
-| `report` | Regenerate the HTML report and print its index path |
+| `report [--days N \| --all]` | Regenerate the HTML report (past 7 days by default) and print its index path |
 | `delete-session opencode SESSION_ID` | Remove learning history; retain skills, coding sessions and minimal reviewer identities |
 | `reconcile REVIEW_ID --state abandoned` | Settle interrupted work after confirming its native execution has stopped |
 
 Stop/reconcile active reviews before deleting their history. Other recovery states: `reconcile --help`; `--state finished` requires a `--result` file with the final review text.
 
+`status` works without OpenCode or provider calls. It never initializes a missing home or database. It inspects private copies of both databases and their WALs under the writer lock, preserving live files and reporting missing/unsupported stores. Worker health uses child-process liveness and heartbeat age; an empty worker list means no registered worker was found.
+
+Use `--project DIRECTORY` with `adopt`, `pin` or `unpin` for that project's `.opencode/skills/`. Proposal approval/rejection uses its saved destination automatically. Project protection records are namespaced in the existing registry; global records and the split database schema are unchanged.
+
 Open the reported `index.html` for **Summary**, **Review sessions** and **Skills & proposals**, with filters and expandable evidence. Reports work offline after OpenCode exits and have no editing controls. Run `report` again for an updated snapshot. Failed generation reports an error and preserves the previous complete report.
 
-Parent transcripts are stored once in local evidence assets and loaded only when expanded. Complete raw records remain available; large records use compact JSON during generation.
+Parent transcripts are stored once in local evidence assets and loaded only when expanded. Generation processes transcripts one review at a time and reuses unchanged evidence and review pages. Complete raw records remain available; large records use compact JSON during generation.
 
 ### Background-session metadata
 
@@ -167,10 +178,11 @@ Offline tests from the checkout root (no provider calls):
 ```bash
 PYTHONPATH="$PWD/plugin/server" python3 -m unittest discover -s tests
 npm ci --ignore-scripts --prefix tests
+python3 tests/prepare_v2_fixtures.py
 node --test tests/*.test.mjs
 ```
 
-Optional 2.0.6/2.0.21/2.0.24 fixtures: `/tmp/opencode/skill-learn-v2-fixtures/<version>/package/`, overridden by `OPENCODE_V2_FIXTURES`. Missing fixtures skip those tests. Browser checks require `google-chrome`. See [adapter verification](plugin/README.md).
+Fixture preparation downloads the pinned releases in `tests/fixtures/v2-sources.json`, verifies their SHA-512 integrity, and unpacks them into ignored `tests/.v2-fixtures/` (override with `OPENCODE_V2_FIXTURES`). Missing fixtures fail the compatibility tests. CI prepares fixtures and runs both suites; tests make no provider calls. Browser checks require `google-chrome`. See [adapter verification](plugin/README.md).
 
 Live cache/latency diagnostics make provider calls. Run from the installed runtime with OpenCode running and an idle parent/queue:
 

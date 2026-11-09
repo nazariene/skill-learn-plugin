@@ -1,8 +1,5 @@
 import { createHash } from "node:crypto"
 
-export const V2_HOST_VERSIONS = Object.freeze(["2.0.6", "2.0.21", "2.0.24"])
-export const supportedHostVersion = version => V2_HOST_VERSIONS.includes(version)
-
 export function reviewMetadata(reviewID, metadata = {}) {
   return { ...metadata, automation: { ...metadata?.automation, owner: "skill-learn", kind: "skill-review", reviewID,
     suppressAudio: true, suppressMemoryCollection: true } }
@@ -155,7 +152,6 @@ export class ParentProfiles {
     const profile = this.parents.get(session.id)
     const latest = profileAnchor(messages)
     if (!profile?.system?.length || !profile.headers) return { compatible: false, reason: "parent-profile-unavailable" }
-    if (!supportedHostVersion(this.hostVersion)) return { compatible: false, reason: "unsupported-host-version" }
     if (!profile.agent || !profile.model.providerID || !profile.model.modelID) return { compatible: false, reason: "parent-profile-incomplete" }
     if (!latest?.id || profile.turnID !== latest.id) return { compatible: false, reason: "parent-profile-stale" }
     if (profile.unavailableOptions.length) return { compatible: false, reason: "unpreservable-provider-options" }
@@ -234,7 +230,7 @@ export class NativeReviews {
       await this.client.session.update({ path: { id: session.id }, query: { directory: this.directory }, body: {
         title: `Skill review [${plan.reviewID}]`, ...(permission?.length ? { permission } : {}),
       }, throwOnError: true }).then(responseData)
-      this.reviewers.set(session.id, { ...plan, state: "ready" })
+      this.reviewers.set(session.id, { ...plan, state: "ready", inherited: new Set(inherited.map(message => message.info.id)) })
       return session.id
     } catch (error) {
       if (session?.id) this.reviewers.set(session.id, { ...plan, state: "preparation-failed" })

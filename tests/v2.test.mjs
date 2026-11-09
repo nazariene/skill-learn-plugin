@@ -2,9 +2,10 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs"
 import { resolve } from "node:path"
+import { execFileSync, spawnSync } from "node:child_process"
 import { ChildCore } from "../plugin/child.mjs"
 import { setupV2, connectV2Host, projectV2Message } from "../plugin/v2.mjs"
-import { V2_HOST_VERSIONS } from "../plugin/native.mjs"
+import { TESTED_V2_HOST_VERSIONS } from "./fixtures/v2-versions.mjs"
 
 const model = { id: "gpt-5.5", providerID: "openai", variants: [{ id: "medium", settings: { reasoningEffort: "medium" } }], limit: { context: 400000 }, settings: { baseURL: "http://native-route" } }
 const selection = { id: model.id, providerID: model.providerID, variant: "medium" }
@@ -55,7 +56,7 @@ function hostFixture(directory, version) {
       requests.push(["create", input]); return structuredClone(sessions.get(id))
     },
     update: async input => {
-      const allowed = version === "2.0.24" ? ["title", "metadata", "permissions"] : ["title", "permissions"]
+      const allowed = ["2.0.24", "2.0.25"].includes(version) ? ["title", "metadata", "permissions"] : ["title", "permissions"]
       Object.assign(sessions.get(input.sessionID), Object.fromEntries(Object.entries(input).filter(([key, value]) => allowed.includes(key) && value !== undefined)))
       requests.push(["context-update", input])
     },
@@ -148,7 +149,7 @@ function hostFixture(directory, version) {
     set held(value) { held = value }, set steps(value) { steps = value }, set duringCall(value) { duringCall = value } }
 }
 
-async function fixture(t, version = "2.0.24", settings = "") {
+async function fixture(t, version = "2.0.25", settings = "") {
   const home = mkdtempSync("/tmp/opencode/skill-v2-")
   writeFileSync(resolve(home, "settings.yaml"), "library:\n  root: skills\nnotifications:\n  enabled: false\ntriggers:\n  idle:\n    seconds: 0\n" + settings)
   const host = hostFixture(home, version), operations = [], timers = new Set(), diagnostics = []
@@ -183,7 +184,7 @@ async function fixture(t, version = "2.0.24", settings = "") {
     stop: () => stop(), restart: async () => { await stop(); await start() } }
 }
 
-for (const version of V2_HOST_VERSIONS.filter(version => version !== "2.0.6")) test(`V2 ${version} fork preserves native history, waits for completion and maps host calls`, async t => {
+for (const version of TESTED_V2_HOST_VERSIONS.filter(version => version !== "2.0.6")) test(`V2 ${version} fork preserves native history, waits for completion and maps host calls`, async t => {
   const f = await fixture(t, version)
   f.host.sessions.get("parent").metadata = { operator: "retained", automation: { customPolicy: "retained" } }
   await f.observe(); await f.settle()
@@ -212,7 +213,52 @@ for (const version of V2_HOST_VERSIONS.filter(version => version !== "2.0.6")) t
   assert.equal(f.operations.filter(entry => entry.op === "enqueue").length, 1)
 })
 
-for (const version of V2_HOST_VERSIONS) test(`V2 ${version} post-compaction continuation uses a freshly observed checkpoint profile`, async t => {
+for (const mode of ["fork", "digest"]) test(`V2 future releases can activate and complete a ${mode} review`, async t => {
+  const f = await fixture(t, "2.0.99", `review:\n  contextMode: ${mode === "fork" ? "auto" : mode}\n`)
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "unchanged", JSON.stringify(finished))
+  const review = await f.core.request("show", { id: finished.payload.reviewID })
+  assert.equal(review.context_mode, mode)
+  assert.equal(review.calls.length, 1)
+  assert.equal(f.host.requests.filter(([op]) => op === "prompt").length, 1)
+})
+
+test("V2 startup settles an interrupted review from a dead host without replay and releases the queue", async t => {
+  const f = await fixture(t, "2.0.99")
+  const deadPID = spawnSync(process.execPath, ["-e", ""]).pid
+  const queued = await f.core.request("enqueue", { harness: "opencode", hostID: "dead-host", hostPID: deadPID,
+    sessionID: "parent", watermark: "interrupted-before-upgrade", messages: [] })
+  await f.core.request("claim", { hostID: "dead-host", hostPID: deadPID, owner: "dead-owner" })
+  await f.core.request("bind", { reviewID: queued.reviewId, reviewerID: "interrupted-reviewer", owner: "dead-owner", inheritedIDs: [] })
+  await f.core.request("admit", { reviewID: queued.reviewId, reviewerID: "interrupted-reviewer", owner: "dead-owner" })
+  f.host.parent("interrupted-reviewer")
+  const error = { type: "aborted", message: "Step interrupted" }
+  f.host.history.set("interrupted-reviewer", [
+    { id: "interrupted-step", type: "assistant", agent: "build", model: selection, finish: "error", error,
+      content: [{ type: "reasoning", text: "Partial reasoning" }] },
+    { id: "interrupted-idle", type: "idle", outcome: "interrupted" },
+  ])
+  execFileSync("python3", ["-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('UPDATE review_state SET lease_until=0 WHERE id=?',(sys.argv[2],)); c.commit()", resolve(f.home, "runtime.sqlite"), queued.reviewId])
+  await f.restart()
+  let review = await f.core.request("show", { id: queued.reviewId })
+  assert.equal(review.status, "failed")
+  assert.match(review.error, /Step interrupted/)
+  assert.equal(review.calls.length, 1)
+  assert.deepEqual(review.calls[0].response.host_message.info.error, error)
+  assert.equal(review.calls[0].response.usage.input_tokens, null)
+  assert.equal(f.host.requests.some(([op]) => op === "prompt"), false)
+  await f.restart()
+  review = await f.core.request("show", { id: queued.reviewId })
+  assert.equal(review.calls.length, 1)
+  assert.equal(f.host.requests.some(([op]) => op === "prompt"), false)
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "unchanged")
+  assert.equal(f.host.requests.filter(([op]) => op === "prompt").length, 1)
+})
+
+for (const version of TESTED_V2_HOST_VERSIONS) test(`V2 ${version} post-compaction continuation uses a freshly observed checkpoint profile`, async t => {
   const f = await fixture(t, version)
   await f.observe()
   const history = f.host.history.get("parent")
@@ -262,7 +308,7 @@ test("V2 2.0.6 uses marked digest sessions without attempting unsupported fork m
   assert.equal(f.host.requests.find(([op]) => op === "create")[1].metadata.automation.suppressAudio, true)
 })
 
-for (const version of V2_HOST_VERSIONS) test(`V2 ${version} unmarked retained reviewers cannot disable startup or trigger recursive learning`, async t => {
+for (const version of TESTED_V2_HOST_VERSIONS) test(`V2 ${version} unmarked retained reviewers cannot disable startup or trigger recursive learning`, async t => {
   const f = await fixture(t, version)
   await f.observe(); await f.settle()
   const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
@@ -339,7 +385,7 @@ for (const phase of ["preload", "registration"]) test(`V2 ${phase} failure rejec
   assert.equal(host.sessions.get("parent").title, "Ordering investigation")
 })
 
-for (const version of V2_HOST_VERSIONS) test(`V2 ${version} digest captures only the latest completed checkpoint and subsequent evidence`, async t => {
+for (const version of TESTED_V2_HOST_VERSIONS) test(`V2 ${version} digest captures only the latest completed checkpoint and subsequent evidence`, async t => {
   const f = await fixture(t, version, "review:\n  contextMode: digest\n")
   f.host.history.get("parent").push(
     { id: "old_checkpoint", type: "compaction", status: "completed", summary: "EXCLUDED_OLD_CHECKPOINT" },
@@ -387,15 +433,18 @@ test("V2 an unrefreshed pre-compaction profile cannot override the current model
   assert.equal(f.host.requests.filter(([op]) => op === "fork").length, 0)
 })
 
-test("V2 discovery rejects another server and unsupported service versions before startup", async () => {
+test("V2 discovery verifies the owning service without restricting its release version", async () => {
   const ctx = { app: { version: "2.0.21" } }
   await assert.rejects(connectV2Host(ctx, { discover: async () => null, makeClient: () => ({}) }), /not registered/)
   await assert.rejects(connectV2Host(ctx, { discover: async () => ({ url: "http://other" }), makeClient: () => ({ server: { info: async () => ({ pid: process.pid + 1, version: ctx.app.version }) } }) }), /not this plugin's host/)
-  await assert.rejects(connectV2Host({ app: { version: "2.0.99" } }), /Unsupported/)
+  await assert.rejects(connectV2Host(ctx, { discover: async () => ({ url: "http://other" }), makeClient: () => ({ server: { info: async () => ({ pid: process.pid, version: "2.0.99" }) } }) }), /not this plugin's host/)
+  const client = { server: { info: async () => ({ pid: process.pid, version: "2.0.99" }) } }
+  const connected = await connectV2Host({ app: { version: "2.0.99" } }, { discover: async () => ({ url: "http://own-host" }), makeClient: () => client })
+  assert.equal(connected.client, client)
 })
 
 test("V2 diagnostics use the retry veto, block auxiliary requests and admit at most two calls", async t => {
-  const f = await fixture(t)
+  const f = await fixture(t, "2.0.99")
   await f.observe()
   f.host.duringCall = async id => {
     const retry = { sessionID: id, attempt: 2, decision: { retry: true, delay: 0 } }
@@ -449,20 +498,60 @@ test("V2 native reviewer guards preserve parent execution and record only the re
   f.host.duringCall = async id => {
     await assert.rejects(f.host.callHook("tool", "execute.before", { sessionID: id, tool: "shell" }), /only load skills/)
     await f.host.callHook("tool", "execute.before", { sessionID: "parent", tool: "shell" })
-    await f.host.callHook("tool", "execute.after", { sessionID: id, tool: "skill", input: { id: "procedure" }, status: "completed",
-      result: { content: "Old snapshot body", metadata: { directory: resolve(f.home, "skills/procedure") } } })
+    const event = { sessionID: id, tool: "skill", input: { id: "procedure" }, status: "completed",
+      result: { content: "Old snapshot body", metadata: { directory: resolve(f.home, "skills/procedure") } } }
+    await f.host.callHook("tool", "execute.after", event)
+    assert.match(event.result.content[0].text, /Current disk body/)
+    assert.equal(event.result.content[0].text.includes("Old snapshot body"), false)
+    const parent = { ...event, sessionID: "parent", result: { content: "Parent output", metadata: {} } }
+    await f.host.callHook("tool", "execute.after", parent)
+    assert.equal(parent.result.content, "Parent output")
   }
   await f.observe(); await f.settle()
   const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
   assert.equal(finished.answer.outcome, "unchanged")
-  const load = f.operations.find(entry => entry.op === "skill-loaded").payload
-  assert.equal(load.body, "Old snapshot body")
-  assert.equal(load.discoveryCompatible, true)
+  const load = f.operations.find(entry => entry.op === "skill-loaded")
+  assert.equal(load.payload.body, "Old snapshot body")
+  assert.equal(load.answer.discoveryCompatible, true)
+})
+
+for (const semantic of [false, true]) test(`V2 host compression permits fork while unknown semantic defaults remain guarded (${semantic})`, async t => {
+  const f = await fixture(t)
+  f.host.ctx.model.list = async () => ({ data: [{ ...model, settings: { ...model.settings, encoding: "zstd", ...(semantic ? { unsupportedSemantic: true } : {}) } }] })
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "unchanged")
+  const review = await f.core.request("show", { id: finished.payload.reviewID })
+  assert.equal(review.context_mode, semantic ? "digest" : "fork")
+  if (semantic) assert.equal(JSON.parse(review.decision_json).reason, "unpreservable-request-defaults")
+})
+
+test("V2 reviewer may load current-project skills but not another project's skills", async t => {
+  const f = await fixture(t)
+  const projectSkill = resolve(f.home, ".opencode/skills/project-guide")
+  const otherSkill = resolve(f.home, "other-project/.opencode/skills/project-guide")
+  for (const directory of [projectSkill, otherSkill]) {
+    mkdirSync(directory, { recursive: true })
+    writeFileSync(resolve(directory, "SKILL.md"), "---\nname: project-guide\ndescription: Project procedures.\nmetadata:\n  origin: generated\n---\nGuide.")
+  }
+  f.host.duringCall = async id => {
+    await f.host.callHook("tool", "execute.after", { sessionID: id, tool: "skill", input: { id: "project-guide" }, status: "completed",
+      result: { content: "Project guide snapshot", metadata: { directory: projectSkill } } })
+    await assert.rejects(f.host.callHook("tool", "execute.after", { sessionID: id, tool: "skill", input: { id: "project-guide" }, status: "completed",
+      result: { content: "Other project guide", metadata: { directory: otherSkill } } }), /different library root/)
+  }
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "unchanged")
+  const loads = f.operations.filter(entry => entry.op === "skill-loaded")
+  assert.deepEqual(loads.map(load => load.answer.discoveryCompatible), [true, false])
+  assert.match(f.host.requests.find(([op]) => op === "prompt")[1].text, /Skill index \(project\):[\s\S]*project-guide/)
 })
 
 test("V2 skill-loading continuation admits and records each model call before collecting a final answer", async t => {
   const f = await fixture(t)
   mkdirSync(resolve(f.home, "skills/procedure"), { recursive: true })
+  writeFileSync(resolve(f.home, "skills/procedure/SKILL.md"), "Procedure body")
   f.host.steps = 2
   await f.observe(); await f.settle()
   const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
@@ -508,6 +597,7 @@ test("V2 refresh discovers a retained reviewer but cannot admit another activati
 test("V2 execution failure after a skill step retains the real error rather than parsing empty feedback", async t => {
   const f = await fixture(t)
   mkdirSync(resolve(f.home, "skills/procedure"), { recursive: true })
+  writeFileSync(resolve(f.home, "skills/procedure/SKILL.md"), "Procedure body")
   f.host.steps = 2
   let calls = 0
   f.host.duringCall = async () => { if (++calls === 2) throw new Error("Synthetic continuation failed") }

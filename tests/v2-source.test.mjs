@@ -2,17 +2,18 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { readFileSync, readdirSync, existsSync } from "node:fs"
 import { resolve } from "node:path"
-import { V2_HOST_VERSIONS } from "../plugin/native.mjs"
+import { TESTED_V2_HOST_VERSIONS } from "./fixtures/v2-versions.mjs"
 
-const root = process.env.OPENCODE_V2_FIXTURES || "/tmp/opencode/skill-learn-v2-fixtures"
-for (const version of V2_HOST_VERSIONS) test(`released V2 ${version} prepares native phases, tools, affinity and normalized usage`, { skip: !existsSync(resolve(root, version)) }, async () => {
+const root = process.env.OPENCODE_V2_FIXTURES || resolve(import.meta.dirname, ".v2-fixtures")
+for (const version of TESTED_V2_HOST_VERSIONS) test(`released V2 ${version} prepares native phases, tools, affinity and normalized usage`, async () => {
+  assert.ok(existsSync(resolve(root, version)), "Run python3 tests/prepare_v2_fixtures.py first")
   const path = resolve(root, version, "package")
   assert.equal(JSON.parse(readFileSync(resolve(path, "package.json"))).version, version)
   const chunks = readdirSync(resolve(path, "dist/chunks")).filter(name => name.endsWith(".js")).map(name => readFileSync(resolve(path, "dist/chunks", name), "utf8"))
   const source = label => { const match = chunks.find(text => text.includes(label)); assert.ok(match, label); return match }
   const load = text => import("data:text/javascript;base64," + Buffer.from(text).toString("base64"))
   const { Effect } = await import("effect")
-  const aiPackage = version === "2.0.6" ? "opencode-ai-v2-0-6" : version === "2.0.24" ? "opencode-ai-v2-0-24" : "@opencode/ai"
+  const aiPackage = version === "2.0.21" ? "@opencode/ai" : "opencode-ai-v" + version.replaceAll(".", "-")
   const { LLM, Message } = await import(aiPackage)
   const OpenAI = await import(aiPackage + "/providers/openai")
   const Responses = await import(aiPackage + "/protocols/openai-responses")
@@ -72,9 +73,11 @@ for (const version of V2_HOST_VERSIONS) test(`released V2 ${version} prepares na
   assert.match(preparation, /promptCacheKey:.*(?:affinity|root)/)
   assert.match(preparation, /headers: \{[\s\S]*x-session-affinity/)
   assert.match(source("// src/session/projector.ts"), /agent: parent.agent,[\s\S]*model: parent.model,[\s\S]*permission: parent.permission/)
+  const tools = source('hooks.trigger("tool", "execute.after", afterEvent)')
+  assert.match(tools, /afterEvent.result.content/)
 })
 
-for (const version of V2_HOST_VERSIONS) test(`released V2 ${version} context update has the actual metadata persistence semantics`, { skip: !existsSync(resolve(root, version)) }, async () => {
+for (const version of TESTED_V2_HOST_VERSIONS) test(`released V2 ${version} context update has the actual metadata persistence semantics`, async () => {
   const path = resolve(root, version, "package/dist/chunks")
   const source = readdirSync(path).filter(name => name.endsWith(".js")).map(name => readFileSync(resolve(path, name), "utf8"))
     .find(text => text.includes("update: Effect.fn(function* (input) {"))
@@ -91,8 +94,9 @@ for (const version of V2_HOST_VERSIONS) test(`released V2 ${version} context upd
     setPermissions: input => Effect.sync(() => { operations.push("permissions"); session.permissions = input.permissions }),
   })
   await Effect.runPromise(update({ sessionID: session.id, title: "Renamed", metadata, permissions: [{ action: "edit", effect: "deny", resource: "*" }] }))
-  assert.deepEqual(operations, version === "2.0.24" ? ["title", "metadata", "permissions"] : ["title", "permissions"])
-  assert.equal(session.metadata.automation?.suppressAudio === true, version === "2.0.24")
+  const metadataUpdates = ["2.0.24", "2.0.25"].includes(version)
+  assert.deepEqual(operations, metadataUpdates ? ["title", "metadata", "permissions"] : ["title", "permissions"])
+  assert.equal(session.metadata.automation?.suppressAudio === true, metadataUpdates)
   assert.equal(session.metadata.operator, "retained")
 })
 

@@ -272,6 +272,28 @@ class Store:
                 raise
         return self.review_context(review_id)
 
+    def review_capture(self, review_id):
+        with self._lock:
+            row = self._connection.execute("SELECT s.capture_json FROM submissions s JOIN reviews r ON r.submission_id=s.id WHERE r.id=?", (review_id,)).fetchone()
+        return json.loads(row["capture_json"] or "{}") if row else {}
+
+    def skill_locations(self, review_id):
+        with self._lock:
+            rows = self._connection.execute("SELECT json_extract(payload_json,'$.name') AS name,json_extract(payload_json,'$.location') AS location FROM evidence WHERE review_id=? AND kind='skill-load' ORDER BY id", (review_id,)).fetchall()
+        return {row["name"]: row["location"] for row in rows}
+
+    def observed_files(self, review_id, location):
+        with self._lock:
+            row = self._connection.execute("""SELECT payload_json FROM evidence WHERE review_id=?
+                AND kind='skill-snapshot' AND json_extract(payload_json,'$.location')=? ORDER BY id DESC LIMIT 1""",
+                (review_id, location)).fetchone()
+        return json.loads(row["payload_json"])["hashes"] if row else {}
+
+    def publication(self, review_id):
+        with self._lock:
+            row = self._connection.execute("SELECT payload_json FROM evidence WHERE review_id=? AND kind='publication' ORDER BY id DESC LIMIT 1", (review_id,)).fetchone()
+        return json.loads(row["payload_json"]) if row else None
+
     def review_context(self, review_id):
         with self._lock:
             review = self._connection.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
@@ -448,15 +470,17 @@ class Store:
             ).fetchall()
         return [_model_call(row) for row in rows]
 
-    def model_call_usage(self):
+    def model_call_usage(self, *, since=None):
         """Dashboard counters without request bodies or attribution trees."""
+        condition = "" if since is None else """WHERE review_id IN (
+            SELECT r.id FROM reviews r JOIN submissions s ON s.id = r.submission_id WHERE s.received_at >= ?)"""
         with self._lock:
             rows = self._connection.execute(
-                """SELECT id, review_id, call_index, call_status, duration_seconds,
+                f"""SELECT id, review_id, call_index, call_status, duration_seconds,
                           CASE WHEN json_type(response_json, '$.usage') = 'object'
                                THEN json_remove(json_extract(response_json, '$.usage'), '$.attribution', '$.host_counters')
                           END AS usage_json
-                   FROM model_calls ORDER BY id"""
+                   FROM model_calls {condition} ORDER BY id""", () if since is None else (since,)
             ).fetchall()
         return [
             {"id": row["id"], "review_id": row["review_id"], "call_index": row["call_index"],
@@ -604,14 +628,14 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_submissions(self, *, delegates_only=False):
-        condition = "WHERE s.delegate_depth > 0 AND r.id IS NULL" if delegates_only else ""
+    def list_submissions(self, *, delegates_only=False, since=None):
+        condition = "AND s.delegate_depth > 0 AND r.id IS NULL" if delegates_only else ""
         with self._lock:
             rows = self._connection.execute(
                 f"""SELECT s.*, r.id AS review_id, r.status AS review_status, r.outcome, r.context_mode, r.called_model
                     FROM submissions s LEFT JOIN reviews r ON r.submission_id = s.id
-                    {condition}
-                    ORDER BY s.received_at"""
+                    WHERE (? IS NULL OR s.received_at >= ?) {condition}
+                    ORDER BY s.received_at""", (since, since)
             ).fetchall()
         return [dict(row) for row in rows]
 

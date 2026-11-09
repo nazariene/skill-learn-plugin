@@ -17,9 +17,12 @@ def file_hash(path: Path) -> str:
 
 
 class Library:
-    def __init__(self, root: Path, store, approval_generated="manual"):
+    def __init__(self, root: Path, store, approval_generated="manual", project_directory=None):
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.project_directory = Path(project_directory) if project_directory else None
+        self.resolved_root = self.root.resolve()
+        if self.project_directory is None:
+            self.root.mkdir(parents=True, exist_ok=True)
         self.store = store
         self.approval_generated = approval_generated
 
@@ -28,11 +31,13 @@ class Library:
         if not self.root.exists():
             return entries
         for skill_dir in sorted(path for path in self.root.iterdir() if path.is_dir() and _NAME.fullmatch(path.name)):
-            document = skill_dir / "SKILL.md"
-            if not document.is_file():
+            if self._skill_dir(skill_dir.name) is None:
+                continue
+            document = self._target(skill_dir.name, "SKILL.md")
+            if document is None or not document.is_file():
                 continue
             text = document.read_text(encoding="utf-8")
-            record = self.store.skill(skill_dir.name)
+            record = self.store.skill(self.registry_key(skill_dir.name))
             origin = record["origin"] if record else ("generated" if _generated_marker(text) else "user")
             pinned = bool(record and record["pinned"])
             protection = record["protection"] if record else None
@@ -88,7 +93,29 @@ class Library:
             blocks.append(f"## {skill['name']} ({status}){file_line}\n{text}".rstrip())
         return "\n\n".join(blocks)
 
-    def apply_feedback(self, review_id, change, absorbing_proposal=None):
+    def snapshot(self, name):
+        directory = self._skill_dir(name)
+        if directory is None or not self._exists(name):
+            return None
+        files, hashes = [], {}
+        for path in sorted(directory.rglob("*")):
+            relative = path.relative_to(directory).as_posix()
+            if relative != "SKILL.md" and not _support_path(relative):
+                continue
+            target = self._target(name, relative)
+            if target is None or not target.is_file():
+                continue
+            raw = target.read_bytes()
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeError:
+                hashes[relative] = False
+                continue
+            hashes[relative] = hashlib.sha256(raw).hexdigest()
+            files.append({"path": relative, "content": content})
+        return {"name": name, "location": str(directory), "hashes": hashes, "files": files}
+
+    def apply_feedback(self, review_id, change, absorbing_proposal=None, observed=None):
         if not isinstance(change, dict):
             return self._refuse(review_id, "", "change", "Each change must be an object.")
         name = change.get("name") if isinstance(change.get("name"), str) else ""
@@ -99,7 +126,11 @@ class Library:
             return self._refuse(review_id, name, action, "Bare delete is refused.")
         self.store.add_evidence(review_id, "change", {"name": name, "action": action, "change": change})
         if action == "create":
-            return self._create(review_id, name, _compose_skill(name, change), change.get("files") or [])
+            result = self._create(review_id, name, _compose_skill(name, change), change.get("files") or [])
+            if result.get("applied") and observed is not None:
+                observed["SKILL.md"] = result["hash"]
+                observed.update({extra["path"]: hashlib.sha256(extra["content"].encode("utf-8")).hexdigest() for extra in change.get("files") or []})
+            return result
         if action in {"edit", "patch", "write_file", "remove_file"}:
             arguments = {
                 "content": _compose_skill(name, change) if action == "edit" else change.get("content"),
@@ -111,10 +142,7 @@ class Library:
             }
             if action == "remove_file" and not absorbing_proposal:
                 return self._refuse(review_id, name, action, "Standalone support-file cleanup is refused.")
-            marks = set()
-            target = self._target(name, arguments.get("file_path") or "SKILL.md")
-            if target and target.is_file():
-                self.view(name, arguments.get("file_path"), marks)
+            marks = observed if observed is not None else self.store.observed_files(review_id, str(self._skill_dir(name)))
             return self._change_existing(review_id, action, name, arguments, marks)
         return self._refuse(review_id, name, action or "change", "action must be create, edit, patch, write_file, or remove_file.")
 
@@ -123,8 +151,8 @@ class Library:
         if target is None or not target.is_file():
             return {"success": False, "error": f"Skill file not found: {name} {file_path or 'SKILL.md'}"}
         text = target.read_text(encoding="utf-8")
-        digest = file_hash(target)
-        read_marks.add(str(target.resolve()))
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        read_marks[file_path or "SKILL.md"] = digest
         return {"success": True, "name": name, "filePath": _display_path(target, self._skill_dir(name)), "content": text, "hash": digest}
 
     def manage(self, review_id, arguments, read_marks):
@@ -147,8 +175,16 @@ class Library:
         if proposal["status"] != "pending":
             return {"ok": False, "error": f"Proposal {proposal_id} is {proposal['status']}"}
         payload = proposal["payload"]
+        if payload.get("projectDirectory") != (str(self.project_directory) if self.project_directory else None):
+            return {"ok": False, "error": "Proposal belongs to a different skill library."}
+        if self.project_directory and (payload.get("libraryRoot") != str(self.root.resolve()) or self._skill_dir(payload["name"]) is None):
+            return {"ok": False, "error": "Project skill library moved or escaped its project. Proposal stays pending."}
         action = payload["action"]
         name = payload["name"]
+        if action in {"patch", "edit", "write_file", "remove_file"}:
+            refusal = self._ownership_refusal(name, action)
+            if refusal:
+                return {"ok": False, "error": refusal}
         if action == "create":
             if self._exists(name):
                 return {"ok": False, "error": f"Skill '{name}' already exists. Proposal {proposal_id} stays pending."}
@@ -157,7 +193,7 @@ class Library:
                 return {"ok": False, "error": f"Skill '{name}' needs a description. Proposal {proposal_id} stays pending."}
             files = payload.get("files") or []
             self._create_package(name, content, files)
-            self.store.save_skill(name, "generated", pinned=False, protection=None)
+            self.store.save_skill(self.registry_key(name), "generated", pinned=False, protection=None)
         elif action == "patch":
             target = self._target(name, payload.get("file_path") or "SKILL.md")
             if target is None or not target.is_file() or file_hash(target) != proposal["base_hash"]:
@@ -201,7 +237,9 @@ class Library:
         else:
             return {"ok": False, "error": f"Cannot apply action {action}"}
         self.store.mark_proposal(proposal_id, status)
-        return {"ok": True, "proposalId": proposal_id, "skill": name}
+        written = content if action in {"create", "edit"} else updated if action == "patch" else payload.get("file_content") if action == "write_file" else None
+        return {"ok": True, "proposalId": proposal_id, "skill": name,
+                "hash": hashlib.sha256(written.encode("utf-8")).hexdigest() if written is not None else None}
 
     def reject(self, proposal_id):
         proposal = self.store.proposal(proposal_id)
@@ -216,7 +254,7 @@ class Library:
         skill_dir = self._skill_dir(name)
         if skill_dir is None or not (skill_dir / "SKILL.md").is_file():
             return {"ok": False, "error": f"No skill named '{name}' to adopt"}
-        current = self.store.skill(name)
+        current = self.store.skill(self.registry_key(name))
         pinned = bool(current and current["pinned"])
         protection = current["protection"] if current else None
         document = skill_dir / "SKILL.md"
@@ -224,17 +262,18 @@ class Library:
         if stamped is None:
             return {"ok": False, "error": f"Skill '{name}' needs a description before it can be adopted"}
         self._replace_file(document, stamped)
-        self.store.save_skill(name, "generated", pinned=pinned, protection=protection)
+        self.store.save_skill(self.registry_key(name), "generated", pinned=pinned, protection=protection)
         return {"ok": True, "skill": name, "origin": "generated"}
 
     def pin(self, name, pinned):
         skill_dir = self._skill_dir(name)
         if skill_dir is None or not (skill_dir / "SKILL.md").is_file():
             return {"ok": False, "error": f"No skill named '{name}' to pin"}
-        current = self.store.skill(name)
+        current = self.store.skill(self.registry_key(name))
         if current is None:
-            self.store.save_skill(name, "user", pinned=pinned, protection=None)
-        elif not self.store.set_pinned(name, pinned):
+            origin = "generated" if _generated_marker((skill_dir / "SKILL.md").read_text(encoding="utf-8")) else "user"
+            self.store.save_skill(self.registry_key(name), origin, pinned=pinned, protection=None)
+        elif not self.store.set_pinned(self.registry_key(name), pinned):
             return {"ok": False, "error": f"No skill named '{name}' to pin"}
         return {"ok": True, "skill": name, "pinned": pinned}
 
@@ -254,7 +293,7 @@ class Library:
             if not isinstance(extra, dict) or not isinstance(extra.get("path"), str) or not _support_path(extra["path"]) or self._target(name, extra["path"]) is None or not isinstance(extra.get("content"), str) or extra["path"] in paths:
                 return self._refuse(review_id, name, "create", "Invalid or duplicate support file.")
             paths.add(extra["path"])
-        proposal_id = self.store.add_proposal(
+        proposal_id = self.add_proposal(
             review_id, name, "create", f"create '{name}'",
             {"action": "create", "name": name, "content": content, "files": files}, None,
         )
@@ -277,21 +316,26 @@ class Library:
         exists = target.is_file()
         if action != "write_file" and not exists:
             return self._refuse(review_id, name, action, f"File not found: {relative}")
-        if require_read and exists and str(target.resolve()) not in read_marks:
+        if require_read and (not read_marks or (exists and relative not in read_marks)):
             return self._refuse(
                 review_id, name, action,
-                f"Refusing {action} for '{name}': load {relative} with skill_view during this review, then retry once.",
+                f"Refusing {action} for '{name}': load the skill during this review before proposing changes.",
             )
+        digest = file_hash(target) if exists else None
+        if require_read and read_marks.get(relative) != digest:
+            return self._refuse(review_id, name, action, f"Skill file '{name}/{relative}' changed since the reviewer observed it; stale change refused.")
         if not exists and action == "write_file":
             content = arguments.get("file_content")
             if not isinstance(content, str):
                 return self._refuse(review_id, name, action, "write_file requires file_content.")
-            proposal_id = self.store.add_proposal(
+            proposal_id = self.add_proposal(
                 review_id, name, action, f"write {relative} in '{name}'",
                 {"action": action, "name": name, "file_path": relative, "file_content": content}, None,
             )
-            return self._publish_if_auto({"success": True, "staged": True, "proposalId": proposal_id, "message": f"Staged {relative} for '{name}'."})
-        digest = file_hash(target)
+            result = self._publish_if_auto({"success": True, "staged": True, "proposalId": proposal_id, "message": f"Staged {relative} for '{name}'."})
+            if result.get("applied"):
+                read_marks[relative] = result["hash"]
+            return result
         if action == "patch":
             old_string = arguments.get("old_string")
             new_string = arguments.get("new_string")
@@ -322,8 +366,19 @@ class Library:
                 return self._refuse(review_id, name, action, "Standalone support-file cleanup is refused.")
             payload = {"action": "remove_file", "name": name, "file_path": relative, "absorbing_proposal": arguments["absorbing_proposal"]}
             gist = f"remove {relative} from '{name}'"
-        proposal_id = self.store.add_proposal(review_id, name, action, gist, payload, digest)
-        return self._publish_if_auto({"success": True, "staged": True, "proposalId": proposal_id, "message": f"Staged {action} for '{name}'. The file is unchanged until approved."})
+        proposal_id = self.add_proposal(review_id, name, action, gist, payload, digest)
+        result = self._publish_if_auto({"success": True, "staged": True, "proposalId": proposal_id, "message": f"Staged {action} for '{name}'. The file is unchanged until approved."})
+        if result.get("applied"):
+            read_marks[relative] = result["hash"]
+        return result
+
+    def registry_key(self, name):
+        return f"project:{self.project_directory}:{name}" if self.project_directory else name
+
+    def add_proposal(self, review_id, name, action, gist, payload, digest):
+        if self.project_directory:
+            payload = {**payload, "projectDirectory": str(self.project_directory), "libraryRoot": str(self.resolved_root)}
+        return self.store.add_proposal(review_id, name, action, gist, payload, digest)
 
     def _publish_if_auto(self, result):
         if result.get("staged") and not result.get("proposalId"):
@@ -333,7 +388,7 @@ class Library:
         applied = self.approve(result["proposalId"], status="applied")
         if not applied["ok"]:
             return {"success": False, "error": applied["error"]}
-        return {"success": True, "applied": True, "staged": False, "proposalId": result["proposalId"], "message": "Applied the skill change."}
+        return {"success": True, "applied": True, "staged": False, "proposalId": result["proposalId"], "hash": applied["hash"], "message": "Applied the skill change."}
 
     def read_under_root(self, relative, read_marks):
         target = self._library_file(relative)
@@ -341,7 +396,7 @@ class Library:
             return {"success": False, "error": "File is outside the service skill library or does not exist."}
         text = target.read_text(encoding="utf-8")
         digest = file_hash(target)
-        read_marks.add(str(target.resolve()))
+        read_marks[target.relative_to(self.root).as_posix()] = digest
         return {"success": True, "path": str(target.relative_to(self.root)), "content": text, "hash": digest, "filePath": str(target.relative_to(self.root))}
 
     def search(self, query):
@@ -373,7 +428,7 @@ class Library:
     def _ownership_refusal(self, name, action):
         if not self._exists(name):
             return f"Skill '{name}' does not exist."
-        record = self.store.skill(name)
+        record = self.store.skill(self.registry_key(name))
         origin = record["origin"] if record else "generated"
         pinned = bool(record and record["pinned"])
         protection = record["protection"] if record else None
@@ -381,8 +436,8 @@ class Library:
             return f"Refusing background {action} for {protection} skill '{name}'."
         if pinned:
             return f"Refusing background {action} for pinned skill '{name}'."
-        document = self._skill_dir(name) / "SKILL.md"
-        marked = _generated_marker(document.read_text(encoding="utf-8")) if document.is_file() else False
+        document = self._target(name, "SKILL.md")
+        marked = _generated_marker(document.read_text(encoding="utf-8")) if document and document.is_file() else False
         if origin != "generated" or not marked:
             return f"Refusing background {action} for skill '{name}': it is user-owned and not agent-managed."
         return None
@@ -392,13 +447,17 @@ class Library:
         return {"success": False, "error": message}
 
     def _exists(self, name):
-        skill_dir = self._skill_dir(name)
-        return skill_dir is not None and (skill_dir / "SKILL.md").is_file()
+        document = self._target(name, "SKILL.md")
+        return document is not None and document.is_file()
 
     def _skill_dir(self, name):
         if not isinstance(name, str) or not _NAME.match(name):
             return None
+        if self.project_directory and (self.root.resolve() != self.resolved_root or not self.resolved_root.is_relative_to(self.project_directory)):
+            return None
         skill_dir = (self.root / name).resolve()
+        if self.project_directory and skill_dir != self.resolved_root / name:
+            return None
         if not skill_dir.is_relative_to(self.root.resolve()):
             return None
         return skill_dir

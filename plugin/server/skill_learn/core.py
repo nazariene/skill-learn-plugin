@@ -1,6 +1,9 @@
 import fcntl
 import json
+import os
+import time
 from contextlib import contextmanager
+from pathlib import Path
 
 from .errors import SkillServiceError
 from .library import Library, _NAME, _support_path, _compose_skill, _stamp_generated
@@ -19,6 +22,7 @@ class Core:
         self.notifier = Notifier(self.settings, self.store, player)
         self.lock = (self.settings.home / "core.lock").open("a")
         self.operation_identity = None
+        self.worker = None
 
     @contextmanager
     def serialized(self):
@@ -29,13 +33,15 @@ class Core:
             fcntl.flock(self.lock, fcntl.LOCK_UN)
 
     def close(self):
+        if self.worker:
+            (self.settings.home / "workers" / f"{os.getpid()}.json").unlink(missing_ok=True)
         self.notifier.flush()
         self.store.close()
         self.lock.close()
 
     def request(self, identity, operation, payload):
         with self.serialized():
-            if operation in {"hello", "state", "pending", "show", "next-probe", "host-skills"}:
+            if operation in {"hello", "state", "review-state", "pending", "show", "next-probe", "host-skills"}:
                 return self.dispatch(operation, payload)
             previous = self.store.begin_operation(identity, operation, payload)
             if previous is not None:
@@ -57,7 +63,17 @@ class Core:
                     "leaseSeconds": self.settings.lease_seconds, "selection": self.settings.selection,
                     "model": self.settings.model, "variant": self.settings.variant}}
         if operation == "state":
-            return {"ok": True, "result": {"reviewers": self.store.reviewers(), "active": next((row for row in self.store.list_reviews() if row["status"] == "running"), None)}}
+            if payload.get("owner"):
+                self.worker = {"owner": payload["owner"], "hostID": payload.get("hostID"), "hostPID": payload.get("hostPID"), "pid": os.getpid()}
+                self.worker_heartbeat()
+            cursor = payload.get("cursor", 0)
+            if type(cursor) is not int or cursor < 0:
+                raise SkillServiceError("Invalid reviewer identity cursor")
+            reviewers = self.store.reviewers(cursor)
+            return {"ok": True, "result": {"reviewers": reviewers, "cursor": reviewers[-1]["cursor"] if reviewers else cursor,
+                    "active": self.store.active_review()}}
+        if operation == "review-state":
+            return {"ok": True, "result": self.store.review_row(payload["reviewID"])}
         if operation == "host-skills":
             import yaml
             skills = []
@@ -128,12 +144,18 @@ class Core:
             required = ("harness", "sessionID", "watermark", "hostID")
             if any(not isinstance(payload.get(key), str) or not payload[key] for key in required) or not isinstance(payload.get("messages"), list):
                 raise SkillServiceError("Submission needs harness/sessionID/watermark/hostID/messages")
-            if any(row["reviewer_id"] == payload["sessionID"] for row in self.store.reviewers()):
+            if self.store.is_reviewer(payload["sessionID"]):
                 return {"disposition": "internal-reviewer"}
             depth = payload.get("delegateDepth", 0)
             if type(depth) is not int or depth < 0:
                 raise SkillServiceError("delegateDepth must be a non-negative integer")
             capture = {key: payload.get(key) for key in ("profile", "compatibility", "permission", "hostID", "hostPID", "hostScope", "directory", "parentInputTokens", "parentOutputTokens")}
+            directory = payload.get("directory")
+            project = payload.get("projectDirectory") or directory
+            if project:
+                if not isinstance(project, str) or not Path(project).is_absolute() or not isinstance(directory, str) or not Path(directory).is_absolute() or not Path(directory).resolve().is_relative_to(Path(project).resolve()):
+                    raise SkillServiceError("Project skill scope must contain the reviewed session directory")
+                capture["projectDirectory"] = str(Path(project).resolve())
             fields = {"harness": payload["harness"], "session_id": payload["sessionID"], "watermark": payload["watermark"],
                       "messages": payload["messages"], "delegate_depth": depth, "session_name": payload.get("sessionName"),
                       "trigger_name": payload.get("trigger"), "capture": capture}
@@ -146,7 +168,7 @@ class Core:
         if operation == "claim":
             answer = self.store.claim(payload["owner"], payload["hostID"], self.settings.lease_seconds, payload.get("hostScope"), payload.get("hostPID"))
             if answer.get("job"):
-                plan = build_plan(self.settings, answer["job"], self.library)
+                plan = build_plan(self.settings, answer["job"], self.library, self.project_library((answer["job"].get("capture") or {}).get("projectDirectory")))
                 self.store.save_plan(plan["reviewID"], plan)
                 return {"plan": plan}
             return answer
@@ -154,6 +176,7 @@ class Core:
             self.store.bind(payload["reviewID"], payload["reviewerID"], payload.get("inheritedIDs", []), payload["owner"])
             return {"bound": True}
         if operation == "heartbeat":
+            self.worker_heartbeat()
             return {"active": self.store.heartbeat(payload["reviewID"], payload["owner"], self.settings.lease_seconds), "cancelRequested": self.store.cancel_requested(payload["reviewID"])}
         if operation == "admit":
             row = self.store.review_row(payload["reviewID"])
@@ -212,8 +235,18 @@ class Core:
                     self.store.refresh_usage(row["id"])
             return {"recorded": True}
         if operation == "skill-loaded":
-            self.store.add_evidence(payload["reviewID"], "skill-load", {"name": payload["name"], "location": payload.get("location"), "fidelity": "host_instance_snapshot", "body": payload.get("body"), "currentDiskMayDiffer": True, "discoveryCompatible": payload.get("discoveryCompatible")})
-            return {"recorded": True}
+            libraries = [self.library, self.project_library(self.store.review_capture(payload["reviewID"]).get("projectDirectory"))]
+            compatible = False
+            for library in libraries:
+                target = library._skill_dir(payload["name"]) if library else None
+                if target and payload.get("location") and Path(payload["location"]).resolve() == target:
+                    compatible = True
+                    break
+            self.store.add_evidence(payload["reviewID"], "skill-load", {"name": payload["name"], "location": payload.get("location"), "fidelity": "host_instance_snapshot", "body": payload.get("body"), "currentDiskMayDiffer": True, "discoveryCompatible": bool(compatible)})
+            snapshot = library.snapshot(payload["name"]) if compatible else None
+            if snapshot:
+                self.store.add_evidence(payload["reviewID"], "skill-snapshot", snapshot)
+            return {"recorded": True, "discoveryCompatible": bool(compatible), "snapshot": snapshot}
         if operation == "finish":
             return self.finish(payload)
         if operation == "cancel":
@@ -257,7 +290,7 @@ class Core:
             return {"settled": True, "replayed": False}
         if operation == "report":
             from .reporting import generate
-            return {"index": str(generate(self.store, self.settings))}
+            return {"index": str(generate(self.store, self.settings, days=payload.get("days", 7)))}
         if operation == "delete-session":
             rows = self.store.reviews_for_session(payload["harness"], payload["sessionID"])
             if any(row["status"] == "running" for row in rows):
@@ -275,15 +308,59 @@ class Core:
                 answer = {**answer, "evidence": self.store.evidence(payload["id"]), "calls": self.store.model_calls_for_review(payload["id"]), "context": self.store.review_context(payload["id"])}
             return {"ok": True, "result": answer}
         if operation in {"approve", "reject", "adopt", "pin", "unpin"}:
-            return self.library.pin(payload["id"], operation == "pin") if operation in {"pin", "unpin"} else getattr(self.library, operation)(payload["id"])
+            library = self.library
+            if operation in {"approve", "reject"}:
+                proposal = self.store.proposal(payload["id"])
+                project = (proposal or {}).get("payload", {}).get("projectDirectory")
+                if project:
+                    if project != self.store.review_capture(proposal["review_id"]).get("projectDirectory"):
+                        raise SkillServiceError("Project proposal does not match its reviewed project")
+                    library = self.project_library(project)
+            elif payload.get("projectDirectory"):
+                library = self.project_library(payload["projectDirectory"])
+            if library is None:
+                raise SkillServiceError("Project skill library is unavailable or outside the reviewed project")
+            return library.pin(payload["id"], operation == "pin") if operation in {"pin", "unpin"} else getattr(library, operation)(payload["id"])
         raise SkillServiceError(f"Unknown operation {operation}")
+
+    def worker_heartbeat(self):
+        if self.worker is None:
+            return
+        directory = self.settings.home / "workers"
+        directory.mkdir(exist_ok=True)
+        temporary = directory / f".{os.getpid()}.json"
+        temporary.write_text(json.dumps({**self.worker, "updatedAt": time.time()}))
+        temporary.replace(directory / f"{os.getpid()}.json")
+
+    def project_library(self, directory):
+        if not directory or not isinstance(directory, str) or not Path(directory).is_absolute():
+            return None
+        project = Path(directory)
+        root = project / ".opencode" / "skills"
+        if project.resolve() != project or not root.is_dir() or not root.resolve().is_relative_to(project):
+            return None
+        if root.resolve() == self.library.root.resolve():
+            return None
+        return Library(root, self.store, self.settings.approval_generated, project_directory=project)
+
+    def feedback_library(self, change, project_library):
+        scope = change.get("scope")
+        if scope not in {None, "global", "project"}:
+            raise SkillServiceError("Feedback scope must be global or project")
+        if scope == "project":
+            if project_library is None:
+                raise SkillServiceError("Project skill library is unavailable or outside the reviewed project")
+            return project_library
+        if scope is None and project_library and project_library._exists(change["name"]):
+            return project_library
+        return self.library
 
     def finish(self, payload):
         row = self.store.review_row(payload["reviewID"])
         if not row:
             return {"outcome": "deleted"}
         if row["status"] != "running":
-            return {"outcome": row["outcome"]}
+            return {"outcome": row["outcome"], "error": row["error"], "publication": self.store.publication(row["id"])}
         if self.store.unfinished_publication(row["id"], self.operation_identity):
             self.store.set_recovery(row["id"], "publication-recovery-needed")
             raise SkillServiceError("Interrupted publication must be reconciled, not replayed")
@@ -298,6 +375,7 @@ class Core:
         text = payload.get("text", "").strip()
         plan = json.loads(row["plan_json"] or "{}")
         outcome, error = "unchanged", None
+        publication = {"applied": 0, "staged": 0, "refused": 0, "warnings": []}
         try:
             if payload.get("error"):
                 raise SkillServiceError(payload["error"])
@@ -310,30 +388,50 @@ class Core:
                 changes = feedback.get("changes") if isinstance(feedback, dict) else None
                 if not isinstance(changes, list):
                     raise SkillServiceError("Review must return JSON changes or Nothing to save.")
-                self.validate_feedback(changes)
-                absorbers, answers = {}, []
+                for change in changes:
+                    if isinstance(change, dict) and change.get("scope") is None and change.get("name") in plan.get("projectSkills", []):
+                        change["scope"] = "project"
+                project_library = self.project_library(self.store.review_capture(row["id"]).get("projectDirectory"))
+                self.validate_feedback(changes, project_library, self.store.skill_locations(row["id"]))
+                absorbers, observations = {}, {}
                 for change in sorted(changes, key=lambda change: change["action"] == "remove_file"):
-                    answer = self.library.apply_feedback(row["id"], change, absorbers.get(change["name"]))
-                    answers.append(answer)
+                    library = self.feedback_library(change, project_library)
+                    key = (str(library.root.resolve()), change["name"])
+                    if key not in observations:
+                        observations[key] = self.store.observed_files(row["id"], str(library._skill_dir(change["name"])))
+                    try:
+                        answer = library.apply_feedback(row["id"], change, absorbers.get(key), observations[key])
+                    except Exception as exception:
+                        answer = library._refuse(row["id"], change["name"], change["action"], str(exception))
+                    if answer.get("applied"):
+                        publication["applied"] += 1
+                    elif answer.get("staged"):
+                        publication["staged"] += 1
+                    else:
+                        publication["refused"] += 1
+                        publication["warnings"].append(f"{change['name']}: {answer.get('error') or 'Skill change was refused.'}")
                     if change["action"] in {"edit", "patch"} and answer.get("success"):
-                        absorbers[change["name"]] = answer.get("proposalId")
-                if any(answer.get("applied") for answer in answers):
+                        absorbers[key] = answer.get("proposalId")
+                if publication["applied"]:
                     outcome = "applied"
-                elif any(answer.get("staged") for answer in answers):
+                elif publication["staged"]:
                     outcome = "staged"
-                elif any(not answer.get("success") for answer in answers):
+                elif publication["refused"]:
                     outcome = "failed"
+                if publication["warnings"]:
+                    error = ("Partial publication: " if outcome != "failed" else "") + "; ".join(publication["warnings"])
             self.store.add_evidence(row["id"], "native-completion", {"text": text, "transcript": payload.get("messages"), "fidelity": "host_observed", "wire_body": None})
         except Exception as exception:
             outcome, error = "failed", str(exception)
+        self.store.add_evidence(row["id"], "publication", publication)
         self.store.interrupt_attempts(row["id"])
         self.store.finish_native(row["id"], outcome, error)
         if plan.get("probeID"):
             self.store.update_probe(plan["probeID"], "failed" if outcome == "failed" else "finished", row["id"], error)
         self.notifier.play("unchanged" if outcome == "unchanged" else "finished" if outcome in {"applied", "staged"} else "failed", row["id"])
-        return {"outcome": outcome, "error": error}
+        return {"outcome": outcome, "error": error, "publication": publication}
 
-    def validate_feedback(self, changes):
+    def validate_feedback(self, changes, project_library=None, skill_locations=None):
         for change in changes:
             if not isinstance(change, dict) or not isinstance(change.get("name"), str) or not _NAME.fullmatch(change["name"]):
                 raise SkillServiceError("Invalid feedback skill name")
@@ -347,7 +445,11 @@ class Core:
             if action == "patch" and (not isinstance(change.get("old_string"), str) or not change["old_string"] or not isinstance(change.get("new_string"), str)):
                 raise SkillServiceError("Invalid patch text")
             path = change.get("file_path") or change.get("path") or "SKILL.md"
-            if self.library._target(change["name"], path) is None:
+            library = self.feedback_library(change, project_library)
+            loaded = (skill_locations or {}).get(change["name"])
+            if action != "create" and loaded and Path(loaded).resolve() != library._skill_dir(change["name"]):
+                raise SkillServiceError(f"Loaded skill '{change['name']}' does not match the selected skill library")
+            if library._target(change["name"], path) is None:
                 raise SkillServiceError("Invalid support path")
             if action in {"write_file", "remove_file"} and not _support_path(path):
                 raise SkillServiceError("Support operation requires a support path")
@@ -357,9 +459,9 @@ class Core:
                     raise SkillServiceError("Support files must be a list")
                 paths = set()
                 for extra in files:
-                    if not isinstance(extra, dict) or not isinstance(extra.get("path"), str) or not _support_path(extra["path"]) or self.library._target(change["name"], extra["path"]) is None or not isinstance(extra.get("content"), str):
+                    if not isinstance(extra, dict) or not isinstance(extra.get("path"), str) or not _support_path(extra["path"]) or library._target(change["name"], extra["path"]) is None or not isinstance(extra.get("content"), str):
                         raise SkillServiceError("Invalid support file")
-                    target = self.library._target(change["name"], extra["path"])
+                    target = library._target(change["name"], extra["path"])
                     if any(target == previous or target in previous.parents or previous in target.parents for previous in paths):
                         raise SkillServiceError("Duplicate or overlapping support paths")
                     paths.add(target)

@@ -44,7 +44,12 @@ def render_home(store, skills=(), section="summary"):
         content = _sessions_tab(reviews, proposals, store.model_call_usage(), home)
     else:
         content = _skills_tab(learned, proposals, reviews)
-    note = '<p class="meta">Offline snapshot. Counts are host-normalized; raw provider usage and wire bodies are unavailable. Refresh: <code>' + escape('skill-learn --home ' + shlex.quote(str(home)) + ' report') + '</code></p>'
+    days = getattr(store, "days", None)
+    period = f"Past {days} days" if days is not None else "All history"
+    if getattr(store, "since", None):
+        period += f" (submissions since {store.since})"
+    refresh = 'skill-learn --home ' + shlex.quote(str(home)) + (' report --all' if days is None else f' report --days {days}')
+    note = '<p class="meta">Offline snapshot. Review activity: ' + escape(period) + '. Library metadata shows the current state. Counts are host-normalized; raw provider usage and wire bodies are unavailable. Refresh: <code>' + escape(refresh) + '</code></p>'
     return _page(title, header + nav + f'<section data-section="{section}">{content}</section>' + note)
 
 
@@ -116,7 +121,7 @@ def _recent_reviews(reviews, proposals):
         f'''<article class="recent-review"><div class="review-heading"><a href="review-{escape(review['id'])}.html">{escape(_session_name(review))}</a>{_pill(review.get('status') or '')}</div>
         <span class="identifier">[{escape(review['session_id'])}]</span>
         <p class="meta">{_time(review.get('started_at') or review.get('received_at'))} · {escape(_harness_name(review.get('harness')))}</p>
-        {_skill_change_summary([proposal for proposal in proposals if proposal['review_id'] == review['id']], compact=True)}</article>'''
+        {_skill_change_summary([proposal for proposal in proposals if proposal['review_id'] == review['id']], compact=True)}{_publication_summary(review)}</article>'''
         for review in latest
     ) + '</div><p><a href="sessions.html">View all review sessions</a></p>'
 
@@ -126,6 +131,8 @@ def render_review(store, review_id, *, lazy_context=False):
     if service_review is None:
         return None
     evidence = store.evidence(review_id)
+    if "publication_json" not in service_review:
+        service_review = {**service_review, "publication_json": next((json.dumps(entry["payload"]) for entry in reversed(evidence) if entry["kind"] == "publication"), None)}
     proposals = store.proposals_for_review(review_id)
     calls = store.model_calls_for_review(review_id)
     usage = _sum_usage(calls)
@@ -148,6 +155,7 @@ def render_review(store, review_id, *, lazy_context=False):
       </header>
       {_navigation('sessions')}
       {_skill_change_summary(proposals)}
+      {_publication_summary(service_review)}
       {_usage_facts(usage)}
       {_panel("Context decision", _context_decision(service_review), "context-decision")}
       {_panel("Requests", _request_compare(store.review_context(review_id), calls, service_review, lazy_context=lazy_context), "requests")}
@@ -261,9 +269,20 @@ def _review_frame(review, calls, proposals=()):
           <span class="identifier">[{escape(review['id'])}]</span>
         </header>
         {_skill_change_summary(proposals)}
+        {_publication_summary(review)}
         {_call_list(calls, lazy=True)}
       </article>
     """
+
+
+def _publication_summary(review):
+    publication = json.loads(review.get("publication_json") or "null")
+    if not publication:
+        return ""
+    counts = " · ".join(f"{publication[key]} {key}" for key in ("applied", "staged", "refused"))
+    warning = "Partial publication" if publication["refused"] and (publication["applied"] or publication["staged"]) else "Publication refused" if publication["refused"] else "Publication"
+    details = "".join(f"<li>{escape(message)}</li>" for message in publication.get("warnings", []))
+    return f'<div class="publication"><p><strong>{warning}</strong> · {counts}</p>' + (f"<ul>{details}</ul>" if details else "") + "</div>"
 
 
 def _call_list(calls, lazy=False):
@@ -358,7 +377,7 @@ def _skill_cards(learned, reviews):
         description = library.get("description") or "Published skill changes recorded by the service."
         searchable = skill["name"] + " " + description + " " + " ".join(proposal["gist"] for proposal in changes)
         searchable += " " + " ".join(_session_name(by_review[proposal["review_id"]]) for proposal in changes if proposal["review_id"] in by_review)
-        history = '<p class="empty">No retained review history for this library skill.</p>'
+        history = '<p class="empty">No review history in this snapshot for this library skill.</p>'
         if changes:
             history = '<ul class="skill-history">' + "".join(
                 f'''<li>{_pill(proposal['status'])} <a href="#proposal-{escape(proposal['id'])}">{escape(proposal['gist'])}</a>

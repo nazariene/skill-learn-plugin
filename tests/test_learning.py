@@ -136,11 +136,70 @@ class LearningTests(unittest.TestCase):
         self.assertIsNone(self.core.store.review_row(review))
         self.assertEqual(self.request("enqueue", harness="opencode", hostID="new-host", sessionID="native_" + review, watermark="new", messages=[])["disposition"], "internal-reviewer")
 
+    def test_polling_returns_incremental_identities_without_historical_plans(self):
+        for index in range(8):
+            review = self.job(parent=str(index))
+            plan = json.loads(self.core.store.review_row(review)["plan_json"])
+            plan["instruction"] = "large history " * 100000
+            self.core.store.save_plan(review, plan)
+            self.request("finish", reviewID=review, text="Nothing to save.")
+        with patch.object(self.core.store, "list_reviews", side_effect=AssertionError("History scan")):
+            initial = self.request("state")
+            self.assertEqual(len(initial["reviewers"]), 8)
+            self.assertLess(len(json.dumps(initial)), 4000)
+            self.assertEqual(self.request("state", cursor=initial["cursor"])["reviewers"], [])
+            active = self.job(parent="active")
+            state = self.request("state", cursor=initial["cursor"])
+            self.assertEqual(len(state["reviewers"]), 1)
+            self.assertEqual(state["active"]["id"], active)
+            self.assertNotIn("plan_json", state["active"])
+            self.assertIn("plan_json", self.request("review-state", reviewID=active))
+        self.request("delete-session", harness="opencode", sessionID="0")
+        self.assertEqual(len(self.request("state")["reviewers"]), 9)
+
+    def test_refused_feedback_records_the_publication_error_without_writing(self):
+        directory = self.core.library.root / "user-owned"
+        directory.mkdir()
+        document = directory / "SKILL.md"
+        document.write_text("---\nname: user-owned\ndescription: Use for work.\n---\nOriginal.")
+        before = document.read_bytes()
+        for name, expected in (("missing", "does not exist"), ("user-owned", "user-owned and not agent-managed")):
+            with self.subTest(name=name):
+                review = self.job(parent=name, watermark=name)
+                feedback = json.dumps({"changes": [{"name": name, "action": "patch", "old_string": "Original.", "new_string": "Updated."}]})
+                finished = self.request("finish", reviewID=review, text=feedback)
+                self.assertEqual(finished["outcome"], "failed")
+                self.assertIn(expected, finished["error"])
+                self.assertEqual(self.core.store.review_row(review)["error"], finished["error"])
+                self.assertEqual(self.core.store.proposals_for_review(review), [])
+                self.assertTrue(any(entry["kind"] == "native-completion" for entry in self.core.store.evidence(review)))
+                self.assertEqual(document.read_bytes(), before)
+
+    def test_partial_publication_preserves_applied_or_staged_outcome(self):
+        for approval, expected in (("auto", "applied"), ("manual", "staged")):
+            with self.subTest(approval=approval):
+                self.core.library.approval_generated = approval
+                review = self.job(parent=approval, watermark=approval)
+                feedback = json.dumps({"changes": [
+                    {"name": "missing", "action": "patch", "old_string": "old", "new_string": "new"},
+                    {"name": "procedure-" + approval, "action": "create", "content": "Use for repeated work."},
+                ]})
+                finished = self.request("finish", reviewID=review, text=feedback)
+                self.assertEqual(finished["outcome"], expected)
+                self.assertEqual(finished["publication"][expected], 1)
+                self.assertEqual(finished["publication"]["refused"], 1)
+                self.assertIn("Partial publication", finished["error"])
+                self.assertEqual(self.request("finish", reviewID=review, text=feedback), finished)
+                self.assertEqual(self.core.store.publication(review), finished["publication"])
+                self.assertEqual(len(self.core.store.proposals_for_review(review)), 1)
+                self.assertTrue(any(entry["kind"] == "refusal" for entry in self.core.store.evidence(review)))
+
     def test_absorbing_manual_edit_support_removal_and_stale_new_file_approval(self):
         review = self.job()
         library = self.core.library
         library.apply_feedback(review, {"name": "procedure", "action": "create", "content": "Use for work.\n\nOld guide.", "files": [{"path": "references/old.md", "content": "old guide"}]})
         library.approval_generated = "manual"
+        self.request("skill-loaded", reviewID=review, name="procedure", location=str(library.root / "procedure"), body="host snapshot")
         staged = library.apply_feedback(review, {"name": "procedure", "action": "patch", "old_string": "Old guide.", "new_string": "Absorbed guide."})
         removal = library.apply_feedback(review, {"name": "procedure", "action": "remove_file", "file_path": "references/old.md"}, staged["proposalId"])
         path = library.root / "procedure/references/old.md"
@@ -155,6 +214,23 @@ class LearningTests(unittest.TestCase):
         target.write_text("operator file")
         self.assertFalse(library.approve(new_file["proposalId"])["ok"])
         self.assertEqual(target.read_text(), "operator file")
+
+    def test_later_publication_exception_keeps_success_and_records_refusal(self):
+        review = self.job()
+        publish = self.core.library._create_package
+        def fail_second(name, content, files):
+            if name == "second":
+                raise OSError("Disk publication failed")
+            return publish(name, content, files)
+        feedback = {"changes": [{"name": name, "action": "create", "content": "Use for repeated work."} for name in ("first", "second")]}
+        with patch.object(self.core.library, "_create_package", side_effect=fail_second):
+            result = self.request("finish", reviewID=review, text=json.dumps(feedback))
+        self.assertEqual(result["outcome"], "applied")
+        self.assertEqual(result["publication"]["applied"], 1)
+        self.assertEqual(result["publication"]["refused"], 1)
+        self.assertIn("Disk publication failed", result["error"])
+        self.assertTrue((self.core.library.root / "first/SKILL.md").is_file())
+        self.assertFalse((self.core.library.root / "second").exists())
 
     def test_interrupted_publication_is_not_replayed_and_abandonment_releases_claim(self):
         review = self.job()
@@ -186,6 +262,7 @@ class LearningTests(unittest.TestCase):
         self.core.store.save_skill("user-owned", "generated")
         self.assertFalse(library.apply_feedback(review, {"name": "user-owned", "action": "edit", "content": "Use for edited work."})["success"])
         self.assertTrue(library.adopt("user-owned")["ok"])
+        self.request("skill-loaded", reviewID=review, name="user-owned", location=str(directory), body="host snapshot")
         self.assertTrue(library.apply_feedback(review, {"name": "user-owned", "action": "patch", "old_string": "Body.", "new_string": "Body. Body."})["applied"])
         self.assertFalse(library.apply_feedback(review, {"name": "user-owned", "action": "patch", "old_string": "Body.", "new_string": "new"})["success"])
         for protection in ("bundled", "hub", "external"):
@@ -194,6 +271,7 @@ class LearningTests(unittest.TestCase):
         self.core.store.save_skill("user-owned", "generated")
         self.assertFalse(library.apply_feedback(review, {"name": "user-owned", "action": "write_file", "file_path": "../outside", "content": "bad"})["success"])
         document = directory / "SKILL.md"
+        self.request("skill-loaded", reviewID=review, name="user-owned", location=str(directory), body="host snapshot")
         before = document.read_bytes()
         real_replace = os.replace
         def fail_new_package(source, target):

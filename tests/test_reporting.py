@@ -7,11 +7,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from skill_learn.core import Core
 from skill_learn.reporting import generate
+from skill_learn import report_view
 from skill_learn.report_view import render_home
 from skill_learn.usage import sum_usage
 
@@ -56,6 +58,107 @@ class ReportingTests(unittest.TestCase):
         command = subprocess.run([sys.executable, "-m", "skill_learn", "--home", str(self.home), *arguments], capture_output=True, text=True)
         self.assertEqual(command.returncode, 0 if ok else 1, command.stderr)
         return json.loads(command.stdout) if ok else command.stderr
+
+    def test_default_week_filters_related_records_and_reuses_retained_evidence(self):
+        current = datetime(2026, 11, 2, 12, tzinfo=timezone.utc)
+        cutoff = current - timedelta(days=7)
+        store = self.core.store
+        reviews = {}
+        proposals = {}
+        calls = {}
+        for name, received in (("expired", cutoff - timedelta(microseconds=1)), ("boundary", cutoff), ("recent", current)):
+            review = self.review(watermark=name)
+            reviews[name] = review
+            proposals[name] = store.add_proposal(review, name + "-skill", "create", name + " proposal", {}, None)
+            calls[name] = store.model_calls_for_review(review)[0]["id"]
+            store._connection.execute("UPDATE submissions SET received_at=? WHERE id=(SELECT submission_id FROM reviews WHERE id=?)",
+                                      (received.isoformat(), review))
+            store._connection.commit()
+        for name, received in (("expired-delegate", cutoff - timedelta(days=1)), ("recent-delegate", current)):
+            self.request("enqueue", harness="opencode", hostID="host", sessionID=name, sessionName=name,
+                         watermark="one", messages=[], delegateDepth=1)
+            store._connection.execute("UPDATE submissions SET received_at=? WHERE session_id=?", (received.isoformat(), name))
+            store._connection.commit()
+        delegates = {row["session_id"]: row["id"] for row in store.list_submissions(delegates_only=True)}
+        with patch("skill_learn.reporting.datetime") as clock:
+            clock.now.return_value = current
+            self.request("report", days=None)
+            previous = self.generation()
+            retained = {f"review-{reviews['recent']}.html", f"context-{reviews['recent']}.js", f"call-{calls['recent']}.js"}
+            inodes = {name: (previous / name).stat().st_ino for name in retained}
+            with patch.object(store, "review_context", side_effect=AssertionError("Unchanged context decoded")):
+                self.request("report")
+        directory = self.generation()
+        for name in ("boundary", "recent"):
+            for asset in (f"review-{reviews[name]}.html", f"context-{reviews[name]}.js", f"call-{calls[name]}.js"):
+                self.assertTrue((directory / asset).is_file(), asset)
+        for asset in (f"review-{reviews['expired']}.html", f"context-{reviews['expired']}.js", f"call-{calls['expired']}.js",
+                      f"review-{delegates['expired-delegate']}.html"):
+            self.assertFalse((directory / asset).exists(), asset)
+            self.assertFalse((previous / asset).exists(), asset)
+        self.assertTrue((directory / f"review-{delegates['recent-delegate']}.html").is_file())
+        for name in retained:
+            self.assertEqual((directory / name).stat().st_ino, inodes[name])
+        skills = (directory / "skills.html").read_text()
+        self.assertNotIn(proposals["expired"], skills)
+        for name in ("boundary", "recent"):
+            self.assertIn(proposals[name], skills)
+        index = (directory / "index.html").read_text()
+        self.assertIn("20,000", index)
+        self.assertNotIn("30,000", index)
+        self.assertIn("Past 7 days", index)
+        self.assertIn(cutoff.isoformat(), index)
+        self.assertIn("report --days 7", index)
+        for page in directory.glob("*.html"):
+            for target in re.findall(r'href="(review-[^"]+\.html)(?:#[^"]+)?"', page.read_text()):
+                self.assertTrue((directory / target).is_file(), target)
+
+    def test_report_cli_and_launcher_default_week_custom_days_and_all_history(self):
+        current = datetime.now(timezone.utc)
+        reviews = {}
+        for name, age in (("recent", 2), ("old", 10)):
+            reviews[name] = self.review(session=name)
+            self.core.store._connection.execute("UPDATE submissions SET received_at=? WHERE session_id=?",
+                                                ((current - timedelta(days=age)).isoformat(), name))
+            self.core.store._connection.commit()
+        script = Path(__file__).resolve().parents[1] / "report.sh"
+        environment = {**os.environ, "SKILL_LEARN_HOME": str(self.home)}
+        for launcher in (False, True):
+            for arguments, expected in (([], {"recent"}), (["--days", "14"], {"recent", "old"}),
+                                        (["--all"], {"recent", "old"}), (["--days", "1"], set())):
+                with self.subTest(launcher=launcher, arguments=arguments):
+                    if launcher:
+                        command = subprocess.run([str(script), *arguments], cwd=self.home, env=environment, capture_output=True, text=True)
+                        self.assertEqual(command.returncode, 0, command.stderr)
+                        self.assertEqual(Path(json.loads(command.stdout)["index"]), self.core.settings.reports_root / "index.html")
+                    else:
+                        self.cli("report", *arguments)
+                    pages = {path.name for path in self.generation().glob("review-*.html")}
+                    self.assertEqual(pages, {f"review-{reviews[name]}.html" for name in expected})
+                    if arguments == ["--all"]:
+                        index = (self.generation() / "index.html").read_text()
+                        self.assertIn("All history", index)
+                        self.assertIn("report --all", index)
+        index = self.core.settings.reports_root / "index.html"
+        previous = index.read_bytes()
+        for arguments in (["--days", "0"], ["--days", "-1"], ["--days", "invalid"], ["--days"],
+                          ["--all", "--days", "7"], ["--days", "7", "--all"]):
+            with self.subTest(invalid=arguments):
+                command = subprocess.run([str(script), *arguments], cwd=self.home, env=environment, capture_output=True, text=True)
+                self.assertNotEqual(command.returncode, 0)
+                self.assertEqual(index.read_bytes(), previous)
+
+    def test_partial_publication_counts_and_warnings_are_visible_on_summary_sessions_and_review(self):
+        review = self.review(result=json.dumps({"changes": [
+            {"name": "procedure", "action": "create", "content": "Use for repeatable work."},
+            {"name": "missing", "action": "patch", "old_string": "old", "new_string": "new"},
+        ]}))
+        self.request("report")
+        for name in ("index.html", "sessions.html", f"review-{review}.html"):
+            text = (self.generation() / name).read_text()
+            self.assertIn("Partial publication", text)
+            self.assertIn("0 applied · 1 staged · 1 refused", text)
+            self.assertIn("does not exist", text)
 
     def test_static_hierarchy_links_complete_evidence_and_escaping(self):
         hostile = '</script><img src=x onerror="window.attacked=true">'
@@ -103,6 +206,115 @@ class ReportingTests(unittest.TestCase):
         self.assertIn('data-context-field="message:0"', detail)
         self.assertIn('data-context-field="request"', detail)
         self.assertIn('data-context-field="parent"', detail)
+
+    def test_unchanged_evidence_is_reused_without_decoding_or_rendering(self):
+        review = self.review()
+        generate(self.core.store, self.core.settings)
+        old = self.generation()
+        names = [f"context-{review}.js", f"review-{review}.html"] + [path.name for path in old.glob("call-*.js")]
+        inodes = {name: (old / name).stat().st_ino for name in names}
+        with patch.object(self.core.store, "review_context", side_effect=AssertionError("Unchanged transcript decoded")), \
+             patch("skill_learn.report_view.render_review", side_effect=AssertionError("Unchanged review rendered")), \
+             patch("skill_learn.report_view._model_call_evidence", side_effect=AssertionError("Unchanged call rendered")):
+            generate(self.core.store, self.core.settings)
+        self.assertNotEqual(old, self.generation())
+        for name in names:
+            self.assertEqual((self.generation() / name).stat().st_ino, inodes[name])
+            self.assertFalse((old / name).exists())
+
+    def test_changed_sources_invalidate_only_their_review(self):
+        first = self.review()
+        second = self.review(session="other")
+        store = self.core.store
+        generate(store, self.core.settings)
+        call = store.model_calls_for_review(first)[0]["id"]
+        mutations = [
+            ("transcript", lambda: store._connection.execute("UPDATE submissions SET messages_json=? WHERE id=(SELECT submission_id FROM reviews WHERE id=?)",
+                 (json.dumps([{"role": "user", "content": "Changed parent evidence"}]), first))),
+            ("capture", lambda: store._connection.execute("UPDATE submissions SET capture_json=? WHERE id=(SELECT submission_id FROM reviews WHERE id=?)",
+                 (json.dumps({"hostID": "changed"}), first))),
+            ("review", lambda: store._connection.execute("UPDATE reviews SET cancel_requested=1 WHERE id=?", (first,))),
+            ("plan", lambda: store._connection.execute("UPDATE runtime.review_state SET plan_json=? WHERE id=?", (json.dumps({"new": "plan"}), first))),
+            ("call", lambda: store._connection.execute("UPDATE model_calls SET response_json=? WHERE id=?",
+                 (json.dumps({"content": "Changed response", "usage": {"input_tokens": 123}}), call))),
+            ("evidence", lambda: store.add_evidence(first, "changed", {"new": "evidence"})),
+            ("proposal", lambda: store.add_proposal(first, "changed", "create", "Changed proposal", {"content": "New skill"}, None)),
+        ]
+        for label, mutate in mutations:
+            with self.subTest(source=label):
+                unchanged_inode = (self.generation() / f"review-{second}.html").stat().st_ino
+                old_page = (self.generation() / f"review-{first}.html").read_bytes()
+                mutate()
+                store._connection.commit()
+                with patch("skill_learn.report_view.render_review", wraps=report_view.render_review) as render:
+                    generate(store, self.core.settings)
+                self.assertEqual([call.args[1] for call in render.call_args_list], [first])
+                self.assertEqual(self.stored_context(first), store.review_context(first))
+                self.assertEqual((self.generation() / f"review-{second}.html").stat().st_ino, unchanged_inode)
+                if label not in {"capture", "review"}:
+                    self.assertNotEqual((self.generation() / f"review-{first}.html").read_bytes(), old_page)
+        self.assertIn("Changed response", (self.generation() / f"call-{call}.js").read_text())
+
+    def test_renderer_changes_old_manifests_and_missing_assets_rebuild(self):
+        review = self.review()
+        store = self.core.store
+        generate(store, self.core.settings)
+        for reason in ("renderer", "legacy", "missing", "symlink"):
+            with self.subTest(reason=reason):
+                old = self.generation()
+                context = old / f"context-{review}.js"
+                if reason == "legacy":
+                    manifest = old / ".skill-learn-report.json"
+                    data = json.loads(manifest.read_text())
+                    manifest.write_text(json.dumps({"format": data["format"], "files": data["files"]}))
+                elif reason in {"missing", "symlink"}:
+                    context.unlink()
+                    if reason == "symlink":
+                        foreign = self.home / "foreign.js"
+                        foreign.write_text("keep foreign file")
+                        context.symlink_to(foreign)
+                with patch("skill_learn.report_view.render_review", wraps=report_view.render_review) as render:
+                    if reason == "renderer":
+                        with patch("skill_learn.reporting._renderer_fingerprint", return_value="changed-renderer"):
+                            generate(store, self.core.settings)
+                    else:
+                        generate(store, self.core.settings)
+                self.assertEqual(render.call_count, 1)
+                self.assertEqual(self.stored_context(review), store.review_context(review))
+                if reason == "symlink":
+                    self.assertEqual(foreign.read_text(), "keep foreign file")
+                    self.assertFalse((self.generation() / context.name).is_symlink())
+
+    def test_lazy_context_reads_share_one_snapshot_and_evidence_scan(self):
+        import sqlite3
+
+        first = self.review()
+        second = self.review(session="other")
+        store = self.core.store
+        original_context = store.review_context(second)
+        original_render = report_view.render_review
+        statements = []
+
+        def render(snapshot, identity, **kwargs):
+            if identity == first:
+                with sqlite3.connect(store.path) as writer:
+                    writer.execute("UPDATE submissions SET messages_json='[]' WHERE id=(SELECT submission_id FROM reviews WHERE id=?)", (second,))
+            return original_render(snapshot, identity, **kwargs)
+
+        store._connection.set_trace_callback(statements.append)
+        try:
+            with patch("skill_learn.report_view.render_review", side_effect=render), \
+                 patch.object(store, "evidence", side_effect=AssertionError("Per-review evidence scan")), \
+                 patch.object(store, "list_model_calls", side_effect=AssertionError("Full decoded call list")):
+                generate(store, self.core.settings)
+        finally:
+            store._connection.set_trace_callback(None)
+        self.assertEqual(self.stored_context(second), original_context)
+        self.assertEqual(store.review_context(second)["messages"], [])
+        self.assertEqual(sum("FROM evidence" in statement for statement in statements), 1)
+        self.assertFalse(store._connection.in_transaction)
+        generate(store, self.core.settings)
+        self.assertEqual(self.stored_context(second)["messages"], [])
 
     def test_overview_and_sessions_use_counters_only_and_partial_usage_is_retained(self):
         review = self.review()
@@ -162,7 +374,7 @@ class ReportingTests(unittest.TestCase):
         store.delete_session("opencode", "session")
         generate(store, self.core.settings)
         skills = (self.generation() / "skills.html").read_text()
-        for text in ('id="skill-retained-skill"', "Pinned", "When investigating &lt;DNS&gt; &amp; cache.", "No retained review history", 'data-skill-states="applied"'):
+        for text in ('id="skill-retained-skill"', "Pinned", "When investigating &lt;DNS&gt; &amp; cache.", "No review history in this snapshot", 'data-skill-states="applied"'):
             self.assertIn(text, skills)
         self.assertNotIn("SECRET BODY", skills)
 
@@ -175,9 +387,10 @@ class ReportingTests(unittest.TestCase):
         context = (old / f"context-{review}.js").read_bytes()
         foreign = old / "operator-note.txt"
         foreign.write_text("keep")
-        with patch("skill_learn.report_view.render_review", side_effect=OSError("disk full")):
+        with patch("skill_learn.report_view.render_home", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 generate(self.core.store, self.core.settings)
+        self.assertFalse(self.core.store._connection.in_transaction)
         self.assertEqual((root / "index.html").read_bytes(), index)
         self.assertEqual((old / f"review-{review}.html").read_bytes(), detail)
         self.assertEqual((old / f"context-{review}.js").read_bytes(), context)
@@ -518,7 +731,13 @@ class ReportingTests(unittest.TestCase):
                     cdp("Runtime.evaluate", {"expression": "new Promise(resolve => { const deadline = Date.now() + 5000; const check = () => { if (" + wait_for + " || Date.now() >= deadline) resolve(); else setTimeout(check, 10); }; check(); })", "awaitPromise": True}, session)
                 return cdp("Runtime.evaluate", {"expression": "document.documentElement.outerHTML", "returnByValue": True}, session)["result"]["value"]
             finally:
-                browser.terminate()
-                browser.wait(timeout=10)
+                if browser.poll() is None:
+                    browser.stdin.write(json.dumps({"id": sequence + 1, "method": "Browser.close"}).encode() + b"\0")
+                    browser.stdin.flush()
+                    try:
+                        browser.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        browser.terminate()
+                        browser.wait(timeout=10)
                 browser.stdin.close()
                 browser.stdout.close()

@@ -97,7 +97,7 @@ def digest_history(messages, tail=24):
     return "\n\n".join(evidence)
 
 
-def build_plan(settings, job, library):
+def build_plan(settings, job, library, project_library=None):
     capture = job.get("capture") or {}
     profile = capture.get("profile") or {}
     parent_model = profile.get("model")
@@ -112,7 +112,7 @@ def build_plan(settings, job, library):
     fork = settings.context_mode == "auto" and same and compatible.get("compatible") is True
     if not same:
         reason = "selected-model-variant-differs"
-    instruction = review_instruction(library, include_index=True) + "\nHost skill discovery/bodies are an instance snapshot and may be older than the current files until restart. Python validates every write against current files."
+    instruction = review_instruction(library, include_index=True, project_library=project_library) + "\nLoad each existing skill you propose changing during this review. The skill result includes a current publication snapshot with support files. Changes to files modified after that snapshot are refused."
     parent_input = token_count(capture.get("parentInputTokens"))
     parent_output = token_count(capture.get("parentOutputTokens"))
     assessed = None
@@ -126,6 +126,7 @@ def build_plan(settings, job, library):
     if not fork:
         instruction = digest_history(project_messages(job["messages"])) + "\n\n" + instruction
     return {"reviewID": job["id"], "parentID": job["session_id"], "watermark": job["watermark"],
+            "projectSkills": [skill["name"] for skill in project_library.list_skills()] if project_library else [],
             "mode": "fork" if fork else "digest", "model": model, "agent": profile.get("agent", "build"),
             "profile": profile, "permission": capture.get("permission", []), "instruction": instruction,
             "budget": settings.input_budget(profile.get("contextWindow") if same else None), "steps": settings.steps,

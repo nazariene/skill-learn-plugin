@@ -12,10 +12,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="skill-learn")
     parser.add_argument("--home", default=DEFAULT_HOME)
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("pending", "report", "child"):
+    for command in ("pending", "child", "status"):
         sub.add_parser(command)
+    report = sub.add_parser("report")
+    period = report.add_mutually_exclusive_group()
+    period.add_argument("--days", type=int, default=argparse.SUPPRESS, help="Report the past N days (default: 7)")
+    period.add_argument("--all", dest="days", action="store_const", const=None, default=argparse.SUPPRESS, help="Report all history")
     for command in ("show", "approve", "reject", "adopt", "pin", "unpin"):
-        sub.add_parser(command).add_argument("id")
+        command_parser = sub.add_parser(command)
+        command_parser.add_argument("id")
+        if command in {"adopt", "pin", "unpin"}:
+            command_parser.add_argument("--project", dest="projectDirectory", help="Project containing .opencode/skills")
     reconcile = sub.add_parser("reconcile")
     reconcile.add_argument("reviewID")
     reconcile.add_argument("--state", choices=("abandoned", "missing", "ambiguous", "active", "finished"), required=True)
@@ -33,8 +40,15 @@ def main(argv=None):
         return 0
     core = None
     try:
+        if args.command == "status":
+            from .diagnostics import status
+            print(json.dumps(status(args.home), ensure_ascii=False, indent=2, default=str))
+            return 0
         core = Core(args.home)
         payload = {key: value for key, value in vars(args).items() if key not in {"command", "home", "result"}}
+        if payload.get("projectDirectory"):
+            from pathlib import Path
+            payload["projectDirectory"] = str(Path(payload["projectDirectory"]).expanduser().resolve())
         if args.command == "reconcile" and args.state == "finished":
             if not args.result:
                 raise SkillServiceError("Finished reconciliation requires --result")

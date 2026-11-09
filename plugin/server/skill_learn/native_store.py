@@ -62,6 +62,7 @@ class NativeStore(Store):
                 id TEXT PRIMARY KEY, parent_id TEXT NOT NULL, mode TEXT NOT NULL,
                 status TEXT NOT NULL, review_id TEXT, error TEXT, created_at TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS runtime.internal_reviewer ON internal_sessions(reviewer_id);
         """)
         self._connection.commit()
 
@@ -69,6 +70,17 @@ class NativeStore(Store):
         with self._lock:
             row = self._connection.execute("SELECT * FROM native_reviews WHERE id=?", (review_id,)).fetchone()
         return dict(row) if row else None
+
+    def active_review(self):
+        with self._lock:
+            row = self._connection.execute("""SELECT r.id,r.cancel_requested,n.owner,n.host_id,n.host_pid,
+                n.reviewer_id,n.lease_until,n.recovery_state FROM main.reviews r
+                LEFT JOIN runtime.review_state n ON n.id=r.id WHERE r.status='running' LIMIT 1""").fetchone()
+        return dict(row) if row else None
+
+    def is_reviewer(self, reviewer_id):
+        with self._lock:
+            return self._connection.execute("SELECT 1 FROM runtime.internal_sessions WHERE reviewer_id=? LIMIT 1", (reviewer_id,)).fetchone() is not None
 
     def list_reviews(self):
         with self._lock:
@@ -130,7 +142,7 @@ class NativeStore(Store):
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
-                active = self._connection.execute("SELECT * FROM native_reviews WHERE status='running' LIMIT 1").fetchone()
+                active = self.active_review()
                 if active:
                     self._connection.commit()
                     return {"active": dict(active), "needsReconcile": (active["lease_until"] or 0) <= time.time()}
@@ -184,12 +196,12 @@ class NativeStore(Store):
         if row["status"] != "running" or row["cancel_requested"]:
             raise SkillServiceError("Review is cancelled; native identity retained for abort/reconciliation")
 
-    def reviewers(self, host_id=None):
+    def reviewers(self, after=0):
         with self._lock:
-            rows = self._connection.execute("""SELECT i.review_id AS id,i.host_id,i.reviewer_id,i.plan_json,
-                i.inherited_json,i.host_pid,i.owner,COALESCE(r.status,'deleted') AS status,
-                r.cancel_requested,r.lease_until FROM runtime.internal_sessions i LEFT JOIN native_reviews r ON r.id=i.review_id
-                WHERE ? IS NULL OR i.host_id=?""", (host_id, host_id)).fetchall()
+            rows = self._connection.execute("""SELECT i.rowid AS cursor,i.review_id AS id,i.host_id,i.reviewer_id,
+                i.host_pid,i.owner,COALESCE(r.status,'deleted') AS status
+                FROM runtime.internal_sessions i LEFT JOIN main.reviews r ON r.id=i.review_id
+                WHERE i.rowid>? ORDER BY i.rowid""", (after,)).fetchall()
         return [dict(row) for row in rows]
 
     def request_probe(self, parent_id, mode):

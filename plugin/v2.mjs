@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto"
 import { resolve } from "node:path"
 import { createPlugin } from "./plugin.mjs"
-import { portableOptions, profileAnchor, responseData, V2_HOST_VERSIONS } from "./native.mjs"
+import { portableOptions, profileAnchor, responseData } from "./native.mjs"
 
 const fingerprint = value => createHash("sha256").update(JSON.stringify(value)).digest("hex")
 const generationKeys = ["temperature", "topP", "topK", "maxTokens"]
-const nativeDefaultKeys = new Set([...generationKeys, "baseURL", "apiKey", "transport"])
+const nativeDefaultKeys = new Set([...generationKeys, "baseURL", "apiKey", "transport", "encoding"])
 const textContent = content => typeof content === "string" ? content : (content || []).filter(part => part.type === "text").map(part => part.text).join("\n")
 const isReviewSession = session => session?.metadata?.automation?.owner === "skill-learn" && session.metadata.automation.kind === "skill-review"
 
@@ -38,7 +38,6 @@ export function projectV2Message(message, session) {
 }
 
 export async function connectV2Host(ctx, { discover, makeClient, pid = process.pid } = {}) {
-  if (!V2_HOST_VERSIONS.includes(ctx.app.version)) throw new Error(`Unsupported OpenCode service version: ${ctx.app.version}`)
   if (!discover || !makeClient) {
     const [{ Service }, { OpenCode }] = await Promise.all([import("@opencode/client/service"), import("@opencode/client")])
     discover = () => Service.discover()
@@ -117,7 +116,7 @@ export async function setupV2(ctx, options = {}, dependencies = {}) {
         await ctx.session.wait({ sessionID: request.path.id })
       },
     } }
-    hooks = await createPlugin({ client, directory, serverUrl: connection.url, hostVersion: ctx.app.version },
+    hooks = await createPlugin({ client, directory, projectDirectory: ctx.location.project?.directory || directory, serverUrl: connection.url, hostVersion: ctx.app.version },
       { ...ctx.options, ...options }, { ...dependencies, hostVersion: ctx.app.version, diagnostic, metadataUpdates: ctx.app.version !== "2.0.6" })
     const ensureReviewer = async (sessionID, session) => {
       if (hooks["native.internal"](sessionID)) return true
@@ -189,8 +188,10 @@ export async function setupV2(ctx, options = {}, dependencies = {}) {
     registrations.push(await ctx.tool.hook("execute.after", async event => {
       if (event.status !== "completed" || event.tool !== "skill") return
       await ensureReviewer(event.sessionID)
-      await hooks["tool.execute.after"]({ ...event, args: { name: event.input?.id } },
-        { metadata: { ...event.result.metadata, dir: event.result.metadata?.directory }, output: textContent(event.result.content) })
+      const output = { metadata: { ...event.result.metadata, dir: event.result.metadata?.directory }, output: textContent(event.result.content) }
+      const original = output.output
+      await hooks["tool.execute.after"]({ ...event, args: { name: event.input?.id } }, output)
+      if (output.output !== original) event.result.content = [{ type: "text", text: output.output }]
     }))
     controller = new AbortController()
     subscription = (async () => {

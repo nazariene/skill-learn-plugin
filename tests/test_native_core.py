@@ -166,6 +166,11 @@ class NativeCoreTests(unittest.TestCase):
         smoke = subprocess.run([str(environment / "bin/skill-learn"), "--home", str(self.home / "fresh"), "pending"], cwd=self.home, env=env, capture_output=True, text=True)
         self.assertEqual(smoke.returncode, 0, smoke.stderr)
         self.assertEqual(json.loads(smoke.stdout), [])
+        inspected_home = self.home / "inspect-only"
+        diagnostic = subprocess.run([str(environment / "bin/skill-learn"), "--home", str(inspected_home), "status"], cwd=self.home, env=env, capture_output=True, text=True)
+        self.assertEqual(diagnostic.returncode, 0, diagnostic.stderr)
+        self.assertEqual(json.loads(diagnostic.stdout)["databases"], {"state": "missing", "runtime": "missing"})
+        self.assertFalse(inspected_home.exists())
         location = subprocess.run([str(python), "-c", "import skill_learn; print(skill_learn.__file__)"], cwd=self.home, env=env, capture_output=True, text=True)
         self.assertIn(str(environment), location.stdout)
 
@@ -242,6 +247,7 @@ class NativeCoreTests(unittest.TestCase):
         self.assertFalse(library.apply_feedback(review, {"name": "procedure", "action": "patch", "old_string": "Old text.", "new_string": "New text."})["success"])
         library.pin("procedure", False)
         library.approval_generated = "manual"
+        store.add_evidence(review, "skill-snapshot", library.snapshot("procedure"))
         staged = library.apply_feedback(review, {"name": "procedure", "action": "patch", "old_string": "Old text.", "new_string": "New text."})
         document = library.root / "procedure/SKILL.md"
         document.write_text(body + "\nConcurrent edit.")

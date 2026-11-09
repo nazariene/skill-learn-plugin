@@ -3,7 +3,7 @@ import { homedir } from "node:os"
 import { resolve } from "node:path"
 import { realpathSync } from "node:fs"
 import { ChildCore } from "./child.mjs"
-import { NativeReviews, ParentProfiles, supportedHostVersion, responseData, readMessages, transcriptWatermark, profileAnchor, portableOptions, portableHeaders } from "./native.mjs"
+import { NativeReviews, ParentProfiles, responseData, readMessages, transcriptWatermark, profileAnchor, portableOptions, portableHeaders } from "./native.mjs"
 
 const AUXILIARY = new Set(["title", "summary", "compaction", "user-memory-collector", "project-memory-collector", "skill-learner", "skill-learning-review", "skill-evaluator", "skill-grader"])
 const hash = value => createHash("sha256").update(JSON.stringify(value)).digest("hex")
@@ -27,7 +27,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
   const hostScope = hash([String(input.serverUrl || "in-process"), input.directory])
   const hostPID = dependencies.pid ?? process.pid
   const activationID = hash([home, hostID])
-  let child, settings, poll, disposed = false, disabled = false, pumping = false, pumpAgain = false
+  let child, settings, poll, disposed = false, disabled = false, pumping = false, pumpAgain = false, reviewerCursor = 0
   const reviewers = new Map(), states = new Map(), buffered = []
   const setTimer = dependencies.setTimer || setTimeout
   const clearTimer = dependencies.clearTimer || clearTimeout
@@ -54,7 +54,6 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
   }
 
   try {
-    if (!supportedHostVersion(profiles.hostVersion)) throw new Error("Unsupported OpenCode V2 service version")
     if (Object.keys(options).some(key => !["home", "python"].includes(key))) throw new Error("Unknown skill-learn plugin option")
     const previous = activations.get(activationID)
     activations.set(activationID, dispose)
@@ -96,12 +95,13 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
   }
 
   async function preload() {
-    const saved = await child.request("state", { hostID })
+    const saved = await child.request("state", { cursor: reviewerCursor, owner, hostID, hostPID })
     for (const row of saved.reviewers) {
       if (reviewers.has(row.reviewer_id)) continue
-      const plan = JSON.parse(row.plan_json || "{}")
+      const detail = row.status === "running" ? await child.request("review-state", { reviewID: row.id }) : null
+      const plan = JSON.parse(detail?.plan_json || "{}")
       reviewers.set(row.reviewer_id, { ...plan, reviewID: row.id, owner: row.owner, hostID: row.host_id, hostPID: row.host_pid,
-        state: "preparing", terminal: row.status !== "running", inherited: new Set(JSON.parse(row.inherited_json || "[]")),
+        state: "preparing", terminal: row.status !== "running", inherited: new Set(JSON.parse(detail?.inherited_json || "[]")),
         attempts: new Map(), pendingCalls: [], seenSteps: new Set(), seenParts: new Map() })
       try {
         // Older hosts cannot repair completed reviewers; their durable IDs still exclude them.
@@ -111,6 +111,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
         if (!error.message.includes("404") && !error.message.includes("NotFound") && !error.message.includes("not found")) throw error
       }
     }
+    reviewerCursor = Math.max(reviewerCursor, saved.cursor ?? 0)
     if (saved.active && (saved.active.lease_until || 0) <= Date.now() / 1000) await reconcile(saved.active)
   }
 
@@ -142,7 +143,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
       const parent = responseData(await input.client.session.get({ path: { id: parentID }, query: { directory: input.directory }, throwOnError: true }))
       parentID = parent?.parentID
     }
-    return { harness: "opencode", hostID, hostPID, hostScope, directory: input.directory, sessionID: id, sessionName: session.title,
+    return { harness: "opencode", hostID, hostPID, hostScope, directory: input.directory, projectDirectory: input.projectDirectory || input.directory, sessionID: id, sessionName: session.title,
       watermark: transcriptWatermark(messages), messages, trigger, delegateDepth, profile, compatibility,
       permission: session.permission || [], parentInputTokens, parentOutputTokens }
   }
@@ -209,7 +210,10 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
         last.info.finish === "tool-calls" ? "Native reviewer ended after tool calls without a final answer" : undefined)
       const payload = { reviewID: review.reviewID, text, messages, error }
       if (cancelled) await child.request("cancel", { reviewID: review.reviewID, hostSettled: true })
-      else await child.request(reconcileState ? "reconcile" : "finish", { ...payload, ...(reconcileState ? { state: "finished" } : {}) })
+      else {
+        const answer = await child.request(reconcileState ? "reconcile" : "finish", { ...payload, ...(reconcileState ? { state: "finished" } : {}) })
+        if (answer.publication?.refused) diagnostic(`${review.reviewID}: ${answer.publication.applied} applied, ${answer.publication.staged} staged, ${answer.publication.refused} refused. ${answer.error}`)
+      }
       review.terminal = true
     } finally { review.collecting = false }
   }
@@ -265,7 +269,6 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
         const probe = await child.request("next-probe")
         if (!probe) return
         try {
-          if (!supportedHostVersion(profiles.hostVersion)) throw new Error("Diagnostic retry bounds require the supported host version")
           const body = await submission(probe.parent_id, "diagnostic")
           if (!body || body.delegateDepth) throw new Error("Probe requires a settled coding parent")
           const status = responseData(await input.client.session.status({ query: { directory: input.directory }, throwOnError: true }))
@@ -282,9 +285,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
       try {
         id = await native.prepare(plan)
         const registered = reviewers.get(id)
-        Object.assign(registered, { owner, hostID, hostPID, inherited: new Set(), attempts: new Map(), pendingCalls: [], seenSteps: new Set(), seenParts: new Map() })
-        const saved = await child.request("state", { hostID })
-        registered.inherited = new Set(JSON.parse(saved.reviewers.find(row => row.reviewer_id === id)?.inherited_json || "[]"))
+        Object.assign(registered, { owner, hostID, hostPID, attempts: new Map(), pendingCalls: [], seenSteps: new Set(), seenParts: new Map() })
         while (buffered.length) await processEvent(buffered.shift())
         const heartbeat = setInterval(() => {
           background(child.request("heartbeat", { reviewID: plan.reviewID, owner }).then(answer => {
@@ -425,13 +426,11 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
       const review = reviewers.get(hookInput.sessionID)
       if (!review || hookInput.tool !== "skill") return
       const location = output.metadata?.dir
-      let compatible = false
-      if (location) {
-        const actual = realpathSync(location), root = realpathSync(settings.libraryRoot)
-        compatible = actual === root || actual.startsWith(root + "/")
-      }
-      await child.request("skill-loaded", { reviewID: review.reviewID, name: hookInput.args?.name || output.metadata?.name, location, body: output.output, discoveryCompatible: compatible })
-      if (!compatible) throw new Error("Skill discovery location is unavailable or resolves to a different library root")
+      const answer = await child.request("skill-loaded", { reviewID: review.reviewID, name: hookInput.args?.name || output.metadata?.name, location, body: output.output })
+      if (!answer.discoveryCompatible) throw new Error("Skill discovery location is unavailable or resolves to a different library root")
+      if (!answer.snapshot) throw new Error("Skill publication snapshot is unavailable")
+      // This exact snapshot, including support files, is what publication may edit.
+      output.output = "Current skill publication snapshot:\n" + JSON.stringify(answer.snapshot, null, 2)
     },
     "native.retry": async event => {
       const review = reviewers.get(event.sessionID)

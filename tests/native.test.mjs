@@ -1,8 +1,8 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { V2_HOST_VERSIONS, NativeReviews, ParentProfiles, transcriptWatermark } from "../plugin/native.mjs"
+import { NativeReviews, ParentProfiles, transcriptWatermark } from "../plugin/native.mjs"
 
-const hostVersion = V2_HOST_VERSIONS.at(-1)
+const hostVersion = "2.0.99"
 const scope = { registryFingerprint: "registry", toolFingerprint: "tools", permissionFingerprint: "permissions", variant: "medium" }
 const parent = { id: "parent", version: hostVersion, permission: [], model: { variant: "medium" }, ...scope }
 
@@ -223,10 +223,11 @@ test("a completed checkpoint establishes a new profile boundary and requires fre
   assert.equal(profiles.compatibility(parent, [...messages, user], selected).reason, "parent-profile-stale")
 })
 
-test("a session creation version cannot establish the running host version", async () => {
+test("host versions are observational and never gate compatible parent profiles", async () => {
   const profiles = new ParentProfiles()
   await observe(profiles)
   assert.equal(profiles.compatibility(parent, raw, {
     providerID: "openai", modelID: "gpt-5.5", variant: "medium",
-  }).reason, "unsupported-host-version")
+  }).compatible, true)
+  assert.equal(profiles.parents.get(parent.id).hostVersion, null)
 })

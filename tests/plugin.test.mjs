@@ -5,9 +5,9 @@ import { execFileSync } from "node:child_process"
 import { resolve } from "node:path"
 import { ChildCore } from "../plugin/child.mjs"
 import { createPlugin } from "../plugin/plugin.mjs"
-import { V2_HOST_VERSIONS, transcriptWatermark } from "../plugin/native.mjs"
+import { transcriptWatermark } from "../plugin/native.mjs"
 
-const hostVersion = V2_HOST_VERSIONS.at(-1)
+const hostVersion = "2.0.99"
 const scope = { registryFingerprint: "registry", toolFingerprint: "tools", permissionFingerprint: "permissions", variant: "medium" }
 
 const model = { providerID: "openai", id: "gpt-5.5", variants: { medium: {} }, limit: { context: 400000 } }
