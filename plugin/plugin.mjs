@@ -12,6 +12,13 @@ const alive = pid => { try { if (!Number.isInteger(pid)) return null; process.ki
 // Reloaded locations can outlive their hooks until an active step settles.
 const activations = globalThis[Symbol.for("skill-learn.activations")] ||= new Map()
 
+function isSessionNotFound(error) {
+  const type = error?._tag || error?.name
+  if (type === "Session.NotFoundError" || type === "SessionNotFoundError") return true
+  // Context errors can have empty messages; retain text fallback for untyped clients only.
+  return (!type || type === "Error") && /404|NotFound|not found/.test(error?.message || "")
+}
+
 export async function createPlugin(input, options = {}, dependencies = {}) {
   const diagnostic = dependencies.diagnostic || (message => console.error(`skill-learn: ${message}`))
   const config = process.env.OPENCODE_CONFIG_DIR || resolve(process.env.XDG_CONFIG_HOME || resolve(homedir(), ".config"), "opencode")
@@ -108,7 +115,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
         if (!reviewers.get(row.reviewer_id).terminal || native.metadataUpdates) await native.mark(row.reviewer_id, row.id)
         reviewers.get(row.reviewer_id).state = "ready"
       } catch (error) {
-        if (!error.message.includes("404") && !error.message.includes("NotFound") && !error.message.includes("not found")) throw error
+        if (!isSessionNotFound(error)) throw error
       }
     }
     reviewerCursor = Math.max(reviewerCursor, saved.cursor ?? 0)
@@ -246,7 +253,7 @@ export async function createPlugin(input, options = {}, dependencies = {}) {
       review.hostID = hostID
       await collect(row.reviewer_id, Boolean(row.cancel_requested), true)
     } catch (error) {
-      if (error.message.includes("404") || error.message.includes("NotFound") || error.message.includes("not found")) await child.request("reconcile", { reviewID: row.id, state: "missing" })
+      if (isSessionNotFound(error)) await child.request("reconcile", { reviewID: row.id, state: "missing" })
       else { diagnostic(`reconciliation requires attention: ${error.message}`); await child.request("reconcile", { reviewID: row.id, state: "ambiguous" }) }
     }
   }

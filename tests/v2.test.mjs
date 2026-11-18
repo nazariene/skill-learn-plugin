@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs"
 import { resolve } from "node:path"
 import { execFileSync, spawnSync } from "node:child_process"
+import { Schema } from "effect"
 import { ChildCore } from "../plugin/child.mjs"
 import { setupV2, connectV2Host, projectV2Message } from "../plugin/v2.mjs"
 import { TESTED_V2_HOST_VERSIONS } from "./fixtures/v2-versions.mjs"
@@ -10,6 +11,9 @@ import { TESTED_V2_HOST_VERSIONS } from "./fixtures/v2-versions.mjs"
 const model = { id: "gpt-5.5", providerID: "openai", variants: [{ id: "medium", settings: { reasoningEffort: "medium" } }], limit: { context: 400000 }, settings: { baseURL: "http://native-route" } }
 const selection = { id: model.id, providerID: model.providerID, variant: "medium" }
 const tokens = { input: 500, output: 10, reasoning: 3, cache: { read: 0, write: 0 } }
+// Released context API errors carry a session ID but no custom message.
+class SessionNotFoundError extends Schema.TaggedError()("Session.NotFoundError", { sessionID: Schema.String }) {}
+
 async function eventually(condition) {
   const until = Date.now() + 5000
   while (Date.now() < until) {
@@ -43,7 +47,7 @@ function hostFixture(directory, version) {
   }
   const session = {
     hook: hook("session"),
-    get: async ({ sessionID }) => { if (!sessions.has(sessionID)) throw Error("not found"); return structuredClone(sessions.get(sessionID)) },
+    get: async ({ sessionID }) => { if (!sessions.has(sessionID)) throw new SessionNotFoundError({ sessionID }); return structuredClone(sessions.get(sessionID)) },
     context: async ({ sessionID }) => {
       requests.push(["context", { sessionID }])
       const messages = history.get(sessionID)
@@ -337,6 +341,63 @@ for (const version of TESTED_V2_HOST_VERSIONS) test(`V2 ${version} unmarked reta
   assert.equal(f.host.requests.some(([op]) => op === "context-update"), false)
 })
 
+for (const [kind, missing] of [
+  ["context tag", sessionID => new SessionNotFoundError({ sessionID })],
+  ["HTTP tag", sessionID => ({ _tag: "SessionNotFoundError", sessionID, message: "" })],
+  ["error name", sessionID => Object.assign(new Error(""), { name: "Session.NotFoundError", sessionID })],
+  ["message", sessionID => new Error(`Session not found: ${sessionID}`)],
+]) test(`V2 missing historical reviewers preserve activation, history and exclusion (${kind})`, async t => {
+  const f = await fixture(t, "2.1.2")
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  const bound = f.operations.find(entry => entry.op === "bind").payload
+  const before = await f.core.request("show", { id: finished.payload.reviewID })
+  f.host.sessions.delete(bound.reviewerID)
+  const get = f.host.ctx.session.get
+  f.host.ctx.session.get = async input => {
+    if (input.sessionID === bound.reviewerID) throw missing(input.sessionID)
+    return get(input)
+  }
+  await f.restart()
+  assert.deepEqual(await f.core.request("show", { id: finished.payload.reviewID }), before)
+  assert.ok((await f.core.request("state")).reviewers.some(row => row.reviewer_id === bound.reviewerID))
+  assert.equal(f.host.requests.filter(([op]) => op === "prompt").length, 1)
+  await assert.rejects(f.host.callHook("tool", "execute.before", { sessionID: bound.reviewerID, tool: "shell" }), /only load skills/)
+  await assert.rejects(f.host.callHook("session", "generate", { sessionID: bound.reviewerID }), /Auxiliary/)
+  f.host.emit("session.execution.succeeded", { sessionID: bound.reviewerID })
+  f.host.parent("after-missing")
+  await f.observe("after-missing"); await f.settle("after-missing")
+  await eventually(() => f.operations.filter(entry => entry.op === "finish").length === 2)
+  assert.equal(f.operations.filter(entry => entry.op === "enqueue").length, 2)
+  assert.equal(f.host.requests.filter(([op]) => op === "prompt").length, 2)
+  assert.equal(f.diagnostics.some(value => value.includes("learning disabled")), false)
+})
+
+test("V2 startup reconciles a missing expired reviewer without replay and releases the queue", async t => {
+  const f = await fixture(t, "2.1.2")
+  const deadPID = spawnSync(process.execPath, ["-e", ""]).pid
+  const queued = await f.core.request("enqueue", { harness: "opencode", hostID: "dead-host", hostPID: deadPID,
+    sessionID: "parent", watermark: "missing-before-restart", messages: [] })
+  await f.core.request("claim", { hostID: "dead-host", hostPID: deadPID, owner: "dead-owner" })
+  await f.core.request("bind", { reviewID: queued.reviewId, reviewerID: "missing-reviewer", owner: "dead-owner", inheritedIDs: [] })
+  await f.core.request("admit", { reviewID: queued.reviewId, reviewerID: "missing-reviewer", owner: "dead-owner" })
+  execFileSync("python3", ["-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('UPDATE review_state SET lease_until=0 WHERE id=?',(sys.argv[2],)); c.commit()", resolve(f.home, "runtime.sqlite"), queued.reviewId])
+  await f.restart()
+  const review = await f.core.request("show", { id: queued.reviewId })
+  assert.equal(review.status, "failed")
+  assert.match(review.error, /no automatic paid replay/)
+  assert.equal(review.calls.length, 1)
+  assert.ok(f.operations.some(entry => entry.op === "reconcile" && entry.payload.state === "missing"))
+  assert.ok((await f.core.request("state")).reviewers.some(row => row.reviewer_id === "missing-reviewer"))
+  await f.restart()
+  assert.deepEqual(await f.core.request("show", { id: queued.reviewId }), review)
+  assert.equal(f.host.requests.some(([op]) => op === "prompt"), false)
+  await f.observe(); await f.settle()
+  const finished = await eventually(() => f.operations.find(entry => entry.op === "finish"))
+  assert.equal(finished.answer.outcome, "unchanged")
+  assert.equal(f.host.requests.filter(([op]) => op === "prompt").length, 1)
+})
+
 test("V2 HTTP metadata persistence is still required before binding or prompting a fork", async t => {
   const f = await fixture(t)
   const update = f.host.client.session.update
@@ -351,7 +412,7 @@ test("V2 HTTP metadata persistence is still required before binding or prompting
   assert.equal(f.host.requests.some(([op]) => op === "prompt"), false)
 })
 
-for (const phase of ["preload", "registration"]) test(`V2 ${phase} failure rejects activation and cleans up its worker and registrations`, async t => {
+for (const phase of ["preload", "registration", "missing-message", "session-access"]) test(`V2 ${phase} failure rejects activation and cleans up its worker and registrations`, async t => {
   const home = mkdtempSync("/tmp/opencode/skill-v2-startup-")
   t.after(() => rmSync(home, { recursive: true, force: true }))
   const host = hostFixture(home, "2.0.24"), diagnostics = [], timers = new Set()
@@ -360,22 +421,27 @@ for (const phase of ["preload", "registration"]) test(`V2 ${phase} failure rejec
     if (op === "hello") return { libraryRoot: resolve(home, "library"), leaseSeconds: 30 }
     if (op === "host-skills") return []
     assert.equal(op, "state")
-    return { reviewers: phase === "preload" ? [{ id: "rv_old", reviewer_id: "old-reviewer", status: "finished" }] : [] }
+    return { reviewers: phase !== "registration" ? [{ id: "rv_old", reviewer_id: "old-reviewer", status: "finished" }] : [] }
   } }
+  const failure = Object.assign(new Error("Resource not found (404)"), {
+    _tag: phase === "missing-message" ? "Session.MessageNotFoundError" : "UnauthorizedError",
+  })
   if (phase === "preload") {
     host.parent("old-reviewer")
     host.client.session.update = async () => {}
-  } else {
+  } else if (phase === "registration") {
     const hook = host.ctx.session.hook
     host.ctx.session.hook = (name, callback) => {
       if (name === "retry") throw new Error("Registration unavailable")
       return hook(name, callback)
     }
+  } else {
+    host.ctx.session.get = async () => { throw failure }
   }
   await assert.rejects(setupV2(host.ctx, { home }, { core, diagnostic: value => diagnostics.push(value),
     connection: { discover: async () => ({ url: "http://own-host" }), makeClient: () => host.client },
     setTimer: callback => { timers.add(callback); return callback }, clearTimer: callback => timers.delete(callback) }),
-  phase === "preload" ? /persist reviewer suppression metadata/ : /Registration unavailable/)
+  phase === "preload" ? /persist reviewer suppression metadata/ : phase === "registration" ? /Registration unavailable/ : error => error === failure)
   assert.equal(closed, true)
   assert.equal(timers.size, 0)
   assert.equal(host.skills.size, 0)

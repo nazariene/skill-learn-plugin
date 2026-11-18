@@ -11,3 +11,4 @@ auth.json
 settings.yaml
 # npm dependencies at any depth; commit manifests and lockfiles only.
 node_modules/
+tests/.v2-fixtures/
